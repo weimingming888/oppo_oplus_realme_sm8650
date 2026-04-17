@@ -1,11 +1,5 @@
 name: 仅编译 hello.ko 内核模块 (不编译内核)
 
-env:
-  TZ: Asia/Shanghai
-  ANDROID_VERSION: 'android14'
-  KERNEL_VERSION: '6.1'
-  SUB_VERSION: '75'
-
 on:
   workflow_dispatch:
 
@@ -25,51 +19,53 @@ jobs:
         run: |
           mkdir -p kernel_workspace
           cd kernel_workspace
-
+          # 下载内核源码
           wget -q https://github.com/cctv18/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_oneplus12.zip -O common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8650-oneplus-sm8650_v_15.0.0_oneplus12 common
-          rm -f common.zip
-
+          # 下载 Clang 20
           mkdir -p clang20
           wget -q https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -O clang.zip
           unzip -q clang.zip -d clang20
-          rm -f clang.zip
-
+          # 下载 Build-tools
           wget -q https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip -O build-tools.zip
           unzip -q build-tools.zip
-          rm -f build-tools.zip
 
       - name: 配置环境变量
         run: |
-          WORKDIR="$(pwd)"
-          echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
-          echo "PATH=$WORKDIR/kernel_workspace/clang20/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH" >> $GITHUB_ENV
+          # 将工具链加入 PATH，以便后续步骤直接使用 clang/ld.lld
+          echo "PATH=$(pwd)/kernel_workspace/clang20/bin:$(pwd)/kernel_workspace/build-tools/bin:$PATH" >> $GITHUB_ENV
 
       - name: 生成配置与头文件
         run: |
-          cd $WORKDIR/kernel_workspace/common
+          cd kernel_workspace/common
           make -j$(nproc) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang LD=ld.lld O=out gki_defconfig
           make -j$(nproc) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang LD=ld.lld O=out modules_prepare
 
-      - name: 编译 hello.ko
+      - name: 编译 hello.ko 并放入根目录
         run: |
-          cd $WORKDIR/kernel_workspace/common
+          cd kernel_workspace/common
           mkdir -p drivers/hello
+          # 从仓库根目录拷贝源代码
           cp $GITHUB_WORKSPACE/hello.c drivers/hello/
-          # 这里修复成 Makefile，不再报错！
           echo "obj-m += hello.o" > drivers/hello/Makefile
 
+          # 执行模块编译
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld \
             O=out \
             M=drivers/hello modules
-
-          ls -lh out/drivers/hello/hello.ko
+          
+          # 👇 关键：将编译出的 ko 拷贝到 GitHub 仓库的根目录
+          cp out/drivers/hello/hello.ko $GITHUB_WORKSPACE/
+          
+          # 验证根目录是否有该文件
+          ls -lh $GITHUB_WORKSPACE/hello.ko
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: hello-ko
-          path: ${{ env.WORKDIR }}/kernel_workspace/common/out/drivers/hello/hello.ko
+          # 现在直接在根目录上传即可
+          path: hello.ko
