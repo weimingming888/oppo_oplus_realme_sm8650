@@ -19,7 +19,7 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt update
-          sudo apt install -y binutils python-is-python3 libssl-dev libelf-dev
+          sudo apt install -y binutils python-is-python3 libssl-dev libelf-dev aria2c
 
       - name: 下载内核源码 + Clang 工具链
         run: |
@@ -27,46 +27,47 @@ jobs:
           cd kernel_workspace
 
           # 下载内核源码
-          aria2c -s16 -x16 https://github.com/cctv18/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_oneplus12.zip -o common.zip
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_oneplus12.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8650-oneplus-sm8650_v_15.0.0_oneplus12 common
           rm -f common.zip
 
           # 下载 Clang 编译器
           mkdir -p clang20
-          aria2c -s16 -x16 https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -o clang.zip
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -o clang.zip
           unzip -q clang.zip -d clang20
           rm -f clang.zip
 
           # 下载 build-tools
-          aria2c -s16 -x16 https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip -o build-tools.zip
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip -o build-tools.zip
           unzip -q build-tools.zip
           rm -f build-tools.zip
 
-      - name: 生成内核默认配置 (仅为编译模块用)
+      - name: 配置环境变量（修复 ld.lld 找不到问题）
         run: |
-          cd kernel_workspace/common
-          
-          # 只生成 .config 不编译内核
+          WORKDIR="$(pwd)"
+          echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
+          echo "PATH=$WORKDIR/kernel_workspace/clang20/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH" >> $GITHUB_ENV
+
+      - name: 生成内核 .config （仅用于模块编译，不编译内核）
+        run: |
+          cd $WORKDIR/kernel_workspace/common
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC="clang" LD="ld.lld" \
+            CC=clang LD=ld.lld \
             O=out gki_defconfig
 
-      - name: 🚀 直接编译 仓库根目录 hello.c 为 hello.ko
+      - name: 🚀 编译仓库根目录 hello.c → hello.ko
         run: |
-          # 把仓库根目录的 hello.c 复制到内核模块目录
-          cd kernel_workspace/common
+          cd $WORKDIR/kernel_workspace/common
           mkdir -p drivers/hello
           cp $GITHUB_WORKSPACE/hello.c drivers/hello/
-
-          # 写 Kbuild
           echo "obj-m += hello.o" > drivers/hello/Kbuild
 
-          # 仅编译模块，不编译内核
+          # 只编译模块，绝对不编译内核
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC="clang" LD="ld.lld" \
+            CC=clang LD=ld.lld \
             O=out \
             M=drivers/hello modules
 
@@ -75,5 +76,5 @@ jobs:
       - name: 📤 上传 hello.ko
         uses: actions/upload-artifact@v4
         with:
-          name: hello-ko
-          path: kernel_workspace/common/out/drivers/hello/hello.ko
+          name: hello-ko-module
+          path: ${{ env.WORKDIR }}/kernel_workspace/common/out/drivers/hello/hello.ko
