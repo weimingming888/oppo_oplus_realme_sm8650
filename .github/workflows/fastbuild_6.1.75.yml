@@ -16,7 +16,7 @@ jobs:
       - name: 检出仓库代码 (获取根目录 hello.c)
         uses: actions/checkout@v4
 
-      - name: 安装基础依赖
+      - name: 安装依赖
         run: |
           sudo apt update
           sudo apt install -y binutils python-is-python3 libssl-dev libelf-dev
@@ -26,36 +26,42 @@ jobs:
           mkdir -p kernel_workspace
           cd kernel_workspace
 
-          # 下载内核源码（用wget，无额外依赖）
+          # 内核源码
           wget -q https://github.com/cctv18/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_oneplus12.zip -O common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8650-oneplus-sm8650_v_15.0.0_oneplus12 common
           rm -f common.zip
 
-          # 下载 Clang 编译器
+          # Clang
           mkdir -p clang20
           wget -q https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -O clang.zip
           unzip -q clang.zip -d clang20
           rm -f clang.zip
 
-          # 下载 build-tools
+          # build-tools
           wget -q https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip -O build-tools.zip
           unzip -q build-tools.zip
           rm -f build-tools.zip
 
-      - name: 配置环境变量（修复 ld.lld 找不到）
+      - name: 配置环境变量
         run: |
           WORKDIR="$(pwd)"
           echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
           echo "PATH=$WORKDIR/kernel_workspace/clang20/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH" >> $GITHUB_ENV
 
-      - name: 生成内核配置 .config (不编译内核)
+      - name: 生成内核配置 + 必备头文件（不编译内核）
         run: |
           cd $WORKDIR/kernel_workspace/common
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld \
             O=out gki_defconfig
+          
+          # 生成模块编译必备头文件（关键修复）
+          make -j$(nproc) LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld \
+            O=out modules_prepare
 
       - name: 🚀 编译 根目录 hello.c → hello.ko
         run: |
@@ -64,7 +70,6 @@ jobs:
           cp $GITHUB_WORKSPACE/hello.c drivers/hello/
           echo "obj-m += hello.o" > drivers/hello/Kbuild
 
-          # 仅编译模块，不编译内核
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld \
@@ -73,7 +78,7 @@ jobs:
 
           ls -lh out/drivers/hello/hello.ko
 
-      - name: 📤 上传 hello.ko 模块
+      - name: 📤 上传 hello.ko
         uses: actions/upload-artifact@v4
         with:
           name: hello-ko
