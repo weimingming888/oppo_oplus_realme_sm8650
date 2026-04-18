@@ -1,156 +1,104 @@
 #include <linux/module.h>
-#include <linux/slab.h>
-#include <sound/core.h>
-#include <sound/pcm.h>
-#include <linux/miscdevice.h>
+#include <linux/input.h>
 #include <linux/uaccess.h>
+#include <linux/miscdevice.h>
 
-#define VIRT_MIC_BUF_SIZE 16384
-static char *virt_mic_buf;
-static size_t buf_len;
+#define TOUCH_X_MAX 1080
+#define TOUCH_Y_MAX 2400
 
-static struct snd_card *g_card;
+struct input_dev *virt_touch;
 
-// 用户态写入接口：/dev/virt_mic
-static ssize_t virt_mic_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
-{
-    if (count > VIRT_MIC_BUF_SIZE)
-        count = VIRT_MIC_BUF_SIZE;
-
-    if (copy_from_user(virt_mic_buf, buf, count))
-        return -EFAULT;
-
-    buf_len = count;
-    return count;
-}
-
-static const struct file_operations virt_mic_fops = {
-    .owner = THIS_MODULE,
-    .write = virt_mic_write,
+struct touch_cmd {
+	int x;
+	int y;
+	int press; // 1=按下 0=抬起
 };
 
-static struct miscdevice virt_mic_misc = {
-    .name  = "virt_mic",
-    .fops  = &virt_mic_fops,
-    .minor = MISC_DYNAMIC_MINOR,
+static ssize_t touch_write(struct file *file, const char __user *ubuf, size_t cnt, loff_t *ppos)
+{
+	struct touch_cmd cmd;
+
+	if (cnt < sizeof(cmd))
+		return -EINVAL;
+
+	if (copy_from_user(&cmd, ubuf, sizeof(cmd)))
+		return -EFAULT;
+
+	if (cmd.press) {
+		input_report_abs(virt_touch, ABS_MT_SLOT, 0);
+		input_report_abs(virt_touch, ABS_MT_TRACKING_ID, 100);
+		input_report_abs(virt_touch, ABS_MT_POSITION_X, cmd.x);
+		input_report_abs(virt_touch, ABS_MT_POSITION_Y, cmd.y);
+		input_report_key(virt_touch, BTN_TOUCH, 1);
+	} else {
+		input_report_abs(virt_touch, ABS_MT_SLOT, 0);
+		input_report_abs(virt_touch, ABS_MT_TRACKING_ID, -1);
+		input_report_key(virt_touch, BTN_TOUCH, 0);
+	}
+
+	input_sync(virt_touch);
+	return cnt;
+}
+
+static const struct file_operations fops = {
+	.owner = THIS_MODULE,
+	.write = touch_write,
 };
 
-// PCM 操作
-static int virt_open(struct snd_pcm_substream *substream)
-{
-    return 0;
-}
-
-static int virt_close(struct snd_pcm_substream *substream)
-{
-    return 0;
-}
-
-static snd_pcm_uframes_t virt_pointer(struct snd_pcm_substream *substream)
-{
-    return 0;
-}
-
-static int virt_capture(struct snd_pcm_substream *substream,
-                        struct snd_pcm_runtime *rt,
-                        unsigned char __user *buf,
-                        snd_pcm_uframes_t frames)
-{
-    size_t bytes = frames * 2; // S16_LE mono
-
-    if (bytes > buf_len)
-        bytes = buf_len;
-
-    if (copy_to_user(buf, virt_mic_buf, bytes))
-        return -EFAULT;
-
-    return bytes;
-}
-
-// 关键：新版内核用 .ioctl 而不是直接 .capture
-static struct snd_pcm_ops virt_pcm_ops = {
-    .open      = virt_open,
-    .close     = virt_close,
-    .pointer   = virt_pointer,
-    .ioctl     = snd_pcm_lib_ioctl,
+static struct miscdevice misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = "virt_touch",
+	.fops  = &fops,
 };
 
-static struct snd_pcm_hardware virt_hw = {
-    .info            = SNDRV_PCM_INFO_INTERLEAVED,
-    .formats         = SNDRV_PCM_FMTBIT_S16_LE,
-    .rates           = SNDRV_PCM_RATE_48000,
-    .rate_min        = 48000,
-    .rate_max        = 48000,
-    .channels_min    = 1,
-    .channels_max    = 1,
-    .buffer_bytes_max = VIRT_MIC_BUF_SIZE,
-};
-
-static int virt_pcm_new(struct snd_card *card)
+static int __init hello_init(void)
 {
-    struct snd_pcm *pcm;
-    int ret;
+	int ret;
 
-    ret = snd_pcm_new(card, "virtmic", 0, 0, 1, &pcm);
-    if (ret)
-        return ret;
+	virt_touch = input_allocate_device();
+	if (!virt_touch)
+		return -ENOMEM;
 
-    snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &virt_pcm_ops);
-    snd_pcm_set_hw_constraint(pcm, SNDRV_PCM_STREAM_CAPTURE, &virt_hw);
+	virt_touch->name = "Virtual Touch";
+	virt_touch->phys = "virt/input";
+	virt_touch->id.bustype = BUS_VIRTUAL;
 
-    return 0;
+	__set_bit(EV_KEY, virt_touch->evbit);
+	__set_bit(EV_ABS, virt_touch->evbit);
+	__set_bit(BTN_TOUCH, virt_touch->keybit);
+
+	input_set_abs_params(virt_touch, ABS_MT_POSITION_X, 0, TOUCH_X_MAX, 0, 0);
+	input_set_abs_params(virt_touch, ABS_MT_POSITION_Y, 0, TOUCH_Y_MAX, 0, 0);
+	input_set_abs_params(virt_touch, ABS_MT_SLOT, 0, 1, 0, 0);
+	input_set_abs_params(virt_touch, ABS_MT_TRACKING_ID, 0, 0xFF, 0, 0);
+
+	ret = input_register_device(virt_touch);
+	if (ret) {
+		input_free_device(virt_touch);
+		return ret;
+	}
+
+	ret = misc_register(&misc);
+	if (ret) {
+		input_unregister_device(virt_touch);
+		input_free_device(virt_touch);
+		return ret;
+	}
+
+	pr_info("hello: virtual touch loaded\n");
+	return 0;
 }
 
-static int __init virt_mic_init(void)
+static void __exit hello_exit(void)
 {
-    int ret;
-
-    virt_mic_buf = kmalloc(VIRT_MIC_BUF_SIZE, GFP_KERNEL);
-    if (!virt_mic_buf)
-        return -ENOMEM;
-
-    ret = misc_register(&virt_mic_misc);
-    if (ret)
-        goto free_buf;
-
-    ret = snd_card_new(NULL, -1, NULL, THIS_MODULE, 0, &g_card);
-    if (ret)
-        goto unreg_misc;
-
-    ret = virt_pcm_new(g_card);
-    if (ret)
-        goto free_card;
-
-    strcpy(g_card->driver, "virtmic");
-    strcpy(g_card->shortname, "virtmic");
-    strcpy(g_card->longname, "Virtual Microphone");
-
-    ret = snd_card_register(g_card);
-    if (ret)
-        goto free_card;
-
-    pr_info("virtmic: loaded\n");
-    return 0;
-
-free_card:
-    snd_card_free(g_card);
-unreg_misc:
-    misc_deregister(&virt_mic_misc);
-free_buf:
-    kfree(virt_mic_buf);
-    return ret;
+	misc_deregister(&misc);
+	input_unregister_device(virt_touch);
+	input_free_device(virt_touch);
+	pr_info("hello: exit\n");
 }
 
-static void __exit virt_mic_exit(void)
-{
-    snd_card_free(g_card);
-    misc_deregister(&virt_mic_misc);
-    kfree(virt_mic_buf);
-    pr_info("virtmic: unloaded\n");
-}
-
-module_init(virt_mic_init);
-module_exit(virt_mic_exit);
+module_init(hello_init);
+module_exit(hello_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Virtual Microphone for MTK");
+MODULE_DESCRIPTION("Virtual Touch Screen");
