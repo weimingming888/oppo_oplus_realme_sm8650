@@ -1,110 +1,99 @@
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/input.h>
-#include <linux/uaccess.h>
-#include <linux/miscdevice.h>
-#include <linux/delay.h>   // 这个补上，msleep 需要
+#include <linux/slab.h>
+#include <linux/device.h>
 
-#define TOUCH_MAX_X 1080
-#define TOUCH_MAX_Y 2400
+/* 虚拟输入设备结构体 */
+static struct input_dev *vinput_dev;
 
-static struct input_dev *virt_touch;
-
-struct touch_cmd {
-	int x;
-	int y;
-};
-
-static ssize_t touch_write(struct file *file, const char __user *ubuf, size_t cnt, loff_t *ppos)
+/* 
+ * sysfs 写入回调函数
+ * 格式: echo "X Y P" > /sys/class/input/eventX/device/vinput_event
+ * X: X坐标, Y: Y坐标, P: 压力 (1按下, 0抬起)
+ */
+static ssize_t vinput_send_event(struct device *dev, 
+                                 struct device_attribute *attr, 
+                                 const char *buf, 
+                                 size_t count)
 {
-	struct touch_cmd cmd;
-	int trk_id = 100;
-	int pressure = 35;
-	int major = 6;
+    int x, y, pressure;
 
-	if (cnt < sizeof(cmd))
-		return -EINVAL;
-	if (copy_from_user(&cmd, ubuf, sizeof(cmd)))
-		return -EFAULT;
+    /* 解析用户空间传入的字符串 */
+    if (sscanf(buf, "%d %d %d", &x, &y, &pressure) == 3) {
+        /* 报告绝对坐标 */
+        input_report_abs(vinput_dev, ABS_X, x);
+        input_report_abs(vinput_dev, ABS_Y, y);
+        /* 报告触摸状态 (BTN_TOUCH) */
+        input_report_key(vinput_dev, BTN_TOUCH, pressure);
+        /* 同步事件，通知上层事件结束 */
+        input_sync(vinput_dev);
+    }
 
-	// 按下
-	input_report_abs(virt_touch, ABS_MT_SLOT, 0);
-	input_report_abs(virt_touch, ABS_MT_TRACKING_ID, trk_id);
-	input_report_abs(virt_touch, ABS_MT_POSITION_X, cmd.x);
-	input_report_abs(virt_touch, ABS_MT_POSITION_Y, cmd.y);
-	input_report_abs(virt_touch, ABS_MT_PRESSURE, pressure);
-	input_report_abs(virt_touch, ABS_MT_TOUCH_MAJOR, major);
-	input_report_key(virt_touch, BTN_TOUCH, 1);
-	input_sync(virt_touch);
-
-	msleep(50);
-
-	// 抬起
-	input_report_abs(virt_touch, ABS_MT_TRACKING_ID, -1);
-	input_report_key(virt_touch, BTN_TOUCH, 0);
-	input_sync(virt_touch);
-
-	return cnt;
+    return count;
 }
 
-static const struct file_operations fops = {
-	.owner = THIS_MODULE,
-	.write = touch_write,
-};
-
-static struct miscdevice misc = {
-	.minor = MISC_DYNAMIC_MINOR,
-	.name  = "virt_touch",
-	.fops  = &fops,
-};
+/* 定义 sysfs 属性：只写权限 (0200) */
+static DEVICE_ATTR(vinput_event, 0200, NULL, vinput_send_event);
 
 static int __init hello_init(void)
 {
-	int ret;
+    int ret;
 
-	virt_touch = input_allocate_device();
-	if (!virt_touch)
-		return -ENOMEM;
+    /* 1. 分配输入设备 */
+    vinput_dev = input_allocate_device();
+    if (!vinput_dev) {
+        pr_err("hello: Failed to allocate input device\n");
+        return -ENOMEM;
+    }
 
-	virt_touch->name = "Virtual Touchscreen";
-	virt_touch->phys = "virt/input0";
-	virt_touch->id.bustype = BUS_VIRTUAL;
+    /* 2. 设置设备名称，Android上层会根据这个名字匹配规则 */
+    vinput_dev->name = "virtual_touch_screen";
+    vinput_dev->id.bustype = BUS_VIRTUAL;
 
-	__set_bit(EV_KEY, virt_touch->evbit);
-	__set_bit(EV_ABS, virt_touch->evbit);
-	__set_bit(BTN_TOUCH, virt_touch->keybit);
+    /* 3. 设置支持的事件类型 */
+    set_bit(EV_ABS, vinput_dev->evbit);       // 绝对坐标事件
+    set_bit(EV_KEY, vinput_dev->evbit);       // 按键事件
+    set_bit(BTN_TOUCH, vinput_dev->keybit);   // 触摸按键
 
-	input_set_abs_params(virt_touch, ABS_MT_SLOT, 0, 1, 0, 0);
-	input_set_abs_params(virt_touch, ABS_MT_TRACKING_ID, 0, 0xFFFF, 0, 0);
-	input_set_abs_params(virt_touch, ABS_MT_POSITION_X, 0, TOUCH_MAX_X, 0, 0);
-	input_set_abs_params(virt_touch, ABS_MT_POSITION_Y, 0, TOUCH_MAX_Y, 0, 0);
-	input_set_abs_params(virt_touch, ABS_MT_PRESSURE, 0, 255, 0, 0);
-	input_set_abs_params(virt_touch, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+    /* 4. 设置绝对坐标范围 (假设模拟一个 1080x2400 的安卓屏幕) */
+    input_set_abs_params(vinput_dev, ABS_X, 0, 1079, 0, 0);
+    input_set_abs_params(vinput_dev, ABS_Y, 0, 2399, 0, 0);
+    input_set_abs_params(vinput_dev, ABS_MT_POSITION_X, 0, 1079, 0, 0);
+    input_set_abs_params(vinput_dev, ABS_MT_POSITION_Y, 0, 2399, 0, 0);
 
-	ret = input_register_device(virt_touch);
-	if (ret) {
-		input_free_device(virt_touch);
-		return ret;
-	}
+    /* 5. 注册输入设备到内核 */
+    ret = input_register_device(vinput_dev);
+    if (ret) {
+        pr_err("hello: Failed to register input device\n");
+        input_free_device(vinput_dev);
+        return ret;
+    }
 
-	ret = misc_register(&misc);
-	if (ret) {
-		input_unregister_device(virt_touch);
-		input_free_device(virt_touch);
-		return ret;
-	}
+    /* 6. 在 /sys/class/input/eventX/device/ 下创建读写节点 */
+    ret = device_create_file(&vinput_dev->dev, &dev_attr_vinput_event);
+    if (ret) {
+        pr_err("hello: Failed to create sysfs file\n");
+        input_unregister_device(vinput_dev);
+        return ret;
+    }
 
-	pr_info("hello: virtual touch loaded\n");
-	return 0;
+    pr_info("hello: Virtual touch screen loaded successfully\n");
+    return 0;
 }
 
 static void __exit hello_exit(void)
 {
-	misc_deregister(&misc);
-	input_unregister_device(virt_touch);
-	input_free_device(virt_touch);
+    /* 移除 sysfs 节点 */
+    device_remove_file(&vinput_dev->dev, &dev_attr_vinput_event);
+    /* 注销并释放设备 */
+    input_unregister_device(vinput_dev);
+    pr_info("hello: Virtual touch screen unloaded\n");
 }
 
 module_init(hello_init);
 module_exit(hello_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("AI Assistant");
+MODULE_DESCRIPTION("Virtual Touch Screen Input Driver for Kernel 6.1");
