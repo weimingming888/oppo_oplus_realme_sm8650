@@ -1,59 +1,49 @@
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/fs.h>
-#include <linux/proc_fs.h>
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
+#include <linux/fs.h>
 
-static struct proc_ops orig_mounts_pops;
-static struct proc_dir_entry *proc_mounts_de;
+static struct kprobe seq_mounts_kp;
 
-// 劫持seq_show，直接返回空，挂载表无内容
-static int empty_mounts_show(struct seq_file *m, void *v)
+// 劫持 mounts 打印函数，直接返回 0 不输出任何挂载行
+static int pre_seq_show_mounts(struct kprobe *p, struct pt_regs *regs)
 {
-    // 不输出任何挂载行，直接空
-    return 0;
-}
+    // seq_show 标准传参：regs[0]=seq_file*, regs[1]=v
+    struct seq_file *m = (struct seq_file *)regs->regs[0];
+    if (!m)
+        return 0;
 
-static int empty_mounts_open(struct inode *inode, struct file *file)
-{
-    return single_open(file, empty_mounts_show, NULL);
+    // 直接跳过原生打印逻辑，返回成功，无任何文本输出
+    regs->regs[0] = 0;
+    return 1;
 }
-
-static struct proc_ops hijack_mounts_pops = {
-    .proc_open = empty_mounts_open,
-    .proc_release = single_release,
-};
 
 static int __init hide_mount_table_init(void)
 {
-    // 获取 /proc/mounts 目录项
-    proc_mounts_de = proc_lookup("mounts", NULL);
-    if (!proc_mounts_de) {
-        pr_err("get /proc/mounts failed\n");
-        return -ENOENT;
-    }
-    // 保存原始操作集
-    memcpy(&orig_mounts_pops, proc_mounts_de->proc_ops, sizeof(struct proc_ops));
-    // 替换成空输出回调
-    proc_mounts_de->proc_ops = &hijack_mounts_pops;
+    int ret;
+    // 内核导出函数：mountinfo/mounts 共用的遍历打印函数
+    seq_mounts_kp.symbol_name = "mountinfo_show";
+    seq_mounts_kp.pre_handler = pre_seq_show_mounts;
 
-    pr_info("Mount table hidden, real mount still work\n");
+    ret = register_kprobe(&seq_mounts_kp);
+    if (ret < 0) {
+        pr_err("register kprobe mountinfo_show failed: %d\n", ret);
+        return ret;
+    }
+    pr_info("hide mount table ok, real mount still valid\n");
     return 0;
 }
 
 static void __exit hide_mount_table_exit(void)
 {
-    // 恢复原生挂载表输出
-    if (proc_mounts_de) {
-        proc_mounts_de->proc_ops = &orig_mounts_pops;
-    }
-    pr_info("Mount table restored\n");
+    unregister_kprobe(&seq_mounts_kp);
+    pr_info("mount table show restored\n");
 }
 
 module_init(hide_mount_table_init);
 module_exit(hide_mount_table_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Test");
-MODULE_DESCRIPTION("Hide all entries in /proc/mounts, real mount unchanged");
+MODULE_KPROBE();
+MODULE_DESCRIPTION("Mask /proc/mounts & /proc/self/mountinfo output, no modify real mount");
