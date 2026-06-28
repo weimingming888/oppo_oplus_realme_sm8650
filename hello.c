@@ -64,7 +64,7 @@ static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
     if (!m)
         return 0;
 
-    pr_info("🚫 Blocked mountinfo_show call (seq_file: %px)\n", m);
+    pr_info("Blocked mountinfo_show call (seq_file: %px)\n", m);
     
     /* 返回1跳过原函数，不输出任何内容 */
     return 1;
@@ -88,7 +88,7 @@ static int pre_mounts_show(struct kprobe *p, struct pt_regs *regs)
     if (!m)
         return 0;
 
-    pr_info("🚫 Blocked mounts_show call (seq_file: %px)\n", m);
+    pr_info("Blocked mounts_show call (seq_file: %px)\n", m);
     
     /* 返回1跳过原函数，不输出任何内容 */
     return 1;
@@ -101,7 +101,7 @@ static int __init hide_mount_table_init(void)
     int success_count = 0;
 
     pr_info("===========================================\n");
-    pr_info("🚀 Loading hide_mount module (FULL HIDE MODE)\n");
+    pr_info("Loading hide_mount module (FULL HIDE MODE)\n");
     pr_info("   Kernel: 6.1.75\n");
     pr_info("===========================================\n");
 
@@ -119,13 +119,13 @@ static int __init hide_mount_table_init(void)
         if (ret == 0) {
             hooked_mountinfo = true;
             success_count++;
-            pr_info("✅ Hooked show_mountinfo at %px\n", 
+            pr_info("Hooked show_mountinfo at %px\n", 
                     (void *)show_mountinfo_addr);
         } else {
-            pr_err("❌ Failed to hook show_mountinfo: %d\n", ret);
+            pr_err("Failed to hook show_mountinfo: %d\n", ret);
         }
     } else {
-        pr_warn("⚠️ show_mountinfo not found\n");
+        pr_warn("show_mountinfo not found\n");
     }
 
     /* ================================================
@@ -151,7 +151,7 @@ static int __init hide_mount_table_init(void)
             if (ret == 0) {
                 hooked_mounts = true;
                 success_count++;
-                pr_info("✅ Hooked %s at %px\n", 
+                pr_info("Hooked %s at %px\n", 
                         mounts_symbols[i], (void *)mounts_show_addr);
                 break;
             }
@@ -159,27 +159,25 @@ static int __init hide_mount_table_init(void)
     }
 
     if (!hooked_mounts) {
-        pr_warn("⚠️ mounts_show not found\n");
-        /* 尝试通过其他方式 */
-        pr_info("💡 Trying alternative method for /proc/mounts...\n");
+        pr_warn("mounts_show not found\n");
     }
 
     /* ================================================
      * 3. 显示结果
      * ================================================ */
     pr_info("===========================================\n");
-    pr_info("📊 Hiding status:\n");
+    pr_info("Hiding status:\n");
     pr_info("   - /proc/self/mountinfo: %s\n", 
-            hooked_mountinfo ? "✅ HIDDEN" : "❌ FAILED");
+            hooked_mountinfo ? "HIDDEN" : "FAILED");
     pr_info("   - /proc/mounts:          %s\n", 
-            hooked_mounts ? "✅ HIDDEN" : "❌ FAILED");
+            hooked_mounts ? "HIDDEN" : "FAILED");
     
     if (success_count == 0) {
-        pr_err("❌ No functions hooked! Module will not work.\n");
+        pr_err("No functions hooked! Module will not work.\n");
         return -ENOENT;
     }
     
-    pr_info("✅ %d function(s) hooked successfully\n", success_count);
+    pr_info("%d function(s) hooked successfully\n", success_count);
     pr_info("===========================================\n");
     
     return 0;
@@ -189,19 +187,19 @@ static int __init hide_mount_table_init(void)
 static void __exit hide_mount_table_exit(void)
 {
     pr_info("===========================================\n");
-    pr_info("🔄 Unloading hide_mount module...\n");
+    pr_info("Unloading hide_mount module...\n");
     
     if (hooked_mountinfo) {
         unregister_kprobe(&seq_mounts_kp);
-        pr_info("✅ Unhooked show_mountinfo\n");
+        pr_info("Unhooked show_mountinfo\n");
     }
     
     if (hooked_mounts) {
         unregister_kprobe(&seq_mounts_kp);
-        pr_info("✅ Unhooked mounts_show\n");
+        pr_info("Unhooked mounts_show\n");
     }
     
-    pr_info("✅ All hooks removed, mount table restored\n");
+    pr_info("All hooks removed, mount table restored\n");
     pr_info("===========================================\n");
 }
 
