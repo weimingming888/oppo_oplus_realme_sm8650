@@ -1,52 +1,78 @@
 #include <linux/module.h>
 #include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
-#include <linux/kallsyms.h>
+#include <linux/proc_fs.h>
 #include <linux/fs.h>
 #include <linux/version.h>
+#include <linux/kallsyms.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/dcache.h>
-#include <linux/path.h>
+#include <linux/namei.h>
 
-static struct kprobe seq_mounts_kp;
-static unsigned long show_mountinfo_addr = 0;
-static unsigned long mounts_show_addr = 0;
-static bool hooked_mountinfo = false;
-static bool hooked_mounts = false;
+static struct kprobe kp;
+static struct proc_dir_entry *proc_entry;
+static bool hooked = false;
 
-/* 查找静态符号地址 */
-static unsigned long find_symbol_addr(const char *sym_name)
+/* 获取挂载点信息 */
+static void show_mount_info(struct seq_file *m)
 {
-    unsigned long addr = 0;
-    char type;
-    char namebuf[KSYM_NAME_LEN];
-    struct kallsym_iter iter;
+    struct file *file;
+    char *buf;
+    loff_t pos = 0;
+    int ret;
     
-    /* 先尝试kallsyms_lookup_name */
-    addr = kallsyms_lookup_name(sym_name);
-    if (addr) {
-        pr_info("Found %s at %px\n", sym_name, (void *)addr);
-        return addr;
+    seq_printf(m, "=== Mount Table Query (Kernel 6.1.75) ===\n");
+    seq_printf(m, "Device: %s\n", current->comm);
+    seq_printf(m, "PID: %d\n", current->pid);
+    seq_printf(m, "===========================================\n\n");
+    
+    /* 通过读取 /proc/self/mountinfo 获取挂载信息 */
+    file = filp_open("/proc/self/mountinfo", O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        seq_printf(m, "Failed to open mountinfo: %ld\n", PTR_ERR(file));
+        return;
     }
     
-    /* 遍历所有符号 */
-    reset_iter(&iter, 0);
-    while (kallsyms_get_next_symbol(&iter)) {
-        if (strcmp(iter.name, sym_name) == 0) {
-            if (iter.type == 't' || iter.type == 'T') {
-                addr = iter.addr;
-                pr_info("Found static symbol: %s at %px (type: %c)\n", 
-                        iter.name, (void *)addr, iter.type);
-                return addr;
+    buf = kmalloc(8192, GFP_KERNEL);
+    if (!buf) {
+        seq_printf(m, "Memory allocation failed\n");
+        filp_close(file, NULL);
+        return;
+    }
+    
+    ret = kernel_read(file, buf, 8191, &pos);
+    if (ret > 0) {
+        buf[ret] = '\0';
+        seq_printf(m, "%s\n", buf);
+    } else {
+        seq_printf(m, "No mount info available (ret=%d)\n", ret);
+    }
+    
+    kfree(buf);
+    filp_close(file, NULL);
+    
+    /* 显示当前进程的挂载信息 */
+    seq_printf(m, "\n=== Current Process Mount Info ===\n");
+    if (current->fs) {
+        char *path = kmalloc(PATH_MAX, GFP_KERNEL);
+        if (path) {
+            char *p = dentry_path_raw(current->fs->root.dentry, path, PATH_MAX);
+            if (!IS_ERR(p)) {
+                seq_printf(m, "Root: %s\n", p);
             }
+            if (current->fs->root.mnt && current->fs->root.mnt->mnt_sb) {
+                seq_printf(m, "FS Type: %s\n", 
+                    current->fs->root.mnt->mnt_sb->s_type->name);
+            }
+            kfree(path);
         }
     }
-    
-    return 0;
 }
 
-/* show_mountinfo的pre_handler - 直接返回1跳过原函数 */
+/* Kprobe pre_handler - 拦截 show_mountinfo */
 static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
@@ -55,8 +81,6 @@ static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
     m = (struct seq_file *)regs->di;
 #elif defined(CONFIG_ARM64)
     m = (struct seq_file *)regs->regs[0];
-#elif defined(CONFIG_ARM)
-    m = (struct seq_file *)regs->ARM_r0;
 #else
     m = (struct seq_file *)regs->regs[0];
 #endif
@@ -64,149 +88,139 @@ static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
     if (!m)
         return 0;
 
-    pr_info("Blocked mountinfo_show call (seq_file: %px)\n", m);
+    pr_info("=== Mount Info Accessed ===\n");
+    pr_info("Process: %s (PID: %d)\n", current->comm, current->pid);
+    pr_info("Hook triggered at: %px\n", p->addr);
     
-    /* 返回1跳过原函数，不输出任何内容 */
-    return 1;
+    /* 显示挂载信息到内核日志 */
+    show_mount_info(m);
+    
+    return 0;  /* 继续执行原函数 */
 }
 
-/* mounts_show的pre_handler - 直接返回1跳过原函数 */
-static int pre_mounts_show(struct kprobe *p, struct pt_regs *regs)
+/* /proc/mount_query 读取函数 */
+static int mount_proc_show(struct seq_file *m, void *v)
 {
-    struct seq_file *m;
+    seq_printf(m, "========================================\n");
+    seq_printf(m, "Mount Table Query Module\n");
+    seq_printf(m, "Kernel: %s\n", utsname()->release);
+    seq_printf(m, "Arch: %s\n", utsname()->machine);
+    seq_printf(m, "========================================\n\n");
     
-#ifdef CONFIG_X86_64
-    m = (struct seq_file *)regs->di;
-#elif defined(CONFIG_ARM64)
-    m = (struct seq_file *)regs->regs[0];
-#elif defined(CONFIG_ARM)
-    m = (struct seq_file *)regs->ARM_r0;
-#else
-    m = (struct seq_file *)regs->regs[0];
-#endif
-
-    if (!m)
-        return 0;
-
-    pr_info("Blocked mounts_show call (seq_file: %px)\n", m);
+    show_mount_info(m);
     
-    /* 返回1跳过原函数，不输出任何内容 */
-    return 1;
+    if (hooked) {
+        seq_printf(m, "\n✅ show_mountinfo hooked at: %px\n", kp.addr);
+    } else {
+        seq_printf(m, "\n❌ No hook active\n");
+    }
+    
+    return 0;
+}
+
+static int mount_proc_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, mount_proc_show, NULL);
+}
+
+static const struct proc_ops mount_proc_fops = {
+    .proc_open = mount_proc_open,
+    .proc_read = seq_read,
+    .proc_release = single_release,
+};
+
+/* 查找并hook show_mountinfo */
+static int hook_mountinfo(void)
+{
+    int ret;
+    unsigned long addr;
+    
+    /* 尝试多个可能的符号名 */
+    const char *symbols[] = {
+        "show_mountinfo",    // 你的手机有这个
+        "mountinfo_show",    // 备选
+        NULL
+    };
+    
+    for (int i = 0; symbols[i] != NULL; i++) {
+        addr = kallsyms_lookup_name(symbols[i]);
+        if (addr) {
+            pr_info("Found symbol: %s at %px", symbols[i], (void *)addr);
+            
+            memset(&kp, 0, sizeof(struct kprobe));
+            kp.pre_handler = pre_show_mountinfo;
+            kp.symbol_name = symbols[i];
+            
+            ret = register_kprobe(&kp);
+            if (ret == 0) {
+                pr_info("✅ Successfully hooked: %s", symbols[i]);
+                hooked = true;
+                return 0;
+            } else {
+                pr_err("Failed to register kprobe for %s: %d", symbols[i], ret);
+            }
+        } else {
+            pr_debug("Symbol %s not found", symbols[i]);
+        }
+    }
+    
+    return -ENOENT;
 }
 
 /* 模块初始化 */
-static int __init hide_mount_table_init(void)
+static int __init mount_query_init(void)
 {
-    int ret = 0;
-    int success_count = 0;
-
-    pr_info("===========================================\n");
-    pr_info("Loading hide_mount module (FULL HIDE MODE)\n");
-    pr_info("   Kernel: 6.1.75\n");
-    pr_info("===========================================\n");
-
-    /* ================================================
-     * 1. Hook show_mountinfo (/proc/self/mountinfo)
-     * ================================================ */
-    show_mountinfo_addr = find_symbol_addr("show_mountinfo");
+    int ret;
     
-    if (show_mountinfo_addr) {
-        memset(&seq_mounts_kp, 0, sizeof(struct kprobe));
-        seq_mounts_kp.pre_handler = pre_show_mountinfo;
-        seq_mounts_kp.addr = (kprobe_opcode_t *)show_mountinfo_addr;
-
-        ret = register_kprobe(&seq_mounts_kp);
-        if (ret == 0) {
-            hooked_mountinfo = true;
-            success_count++;
-            pr_info("Hooked show_mountinfo at %px\n", 
-                    (void *)show_mountinfo_addr);
-        } else {
-            pr_err("Failed to hook show_mountinfo: %d\n", ret);
-        }
+    pr_info("===========================================\n");
+    pr_info("Mount Table Query Module\n");
+    pr_info("Kernel: %s\n", utsname()->release);
+    pr_info("===========================================\n");
+    
+    /* 创建 /proc/mount_query */
+    proc_entry = proc_create("mount_query", 0444, NULL, &mount_proc_fops);
+    if (!proc_entry) {
+        pr_err("Failed to create /proc/mount_query\n");
+        return -ENOMEM;
+    }
+    pr_info("Created /proc/mount_query");
+    
+    /* Hook show_mountinfo */
+    ret = hook_mountinfo();
+    if (ret == 0) {
+        pr_info("Module loaded with hook active");
     } else {
-        pr_warn("show_mountinfo not found\n");
+        pr_warn("Module loaded without hook (only /proc/mount_query available)");
     }
-
-    /* ================================================
-     * 2. Hook mounts_show (/proc/mounts)
-     * ================================================ */
-    /* 重新初始化kprobe结构 */
-    memset(&seq_mounts_kp, 0, sizeof(struct kprobe));
-    seq_mounts_kp.pre_handler = pre_mounts_show;
     
-    /* 尝试多个可能的函数名 */
-    const char *mounts_symbols[] = {
-        "mounts_show",
-        "show_mounts",
-        "proc_mounts_show",
-        NULL
-    };
-
-    for (int i = 0; mounts_symbols[i] != NULL; i++) {
-        mounts_show_addr = find_symbol_addr(mounts_symbols[i]);
-        if (mounts_show_addr) {
-            seq_mounts_kp.addr = (kprobe_opcode_t *)mounts_show_addr;
-            ret = register_kprobe(&seq_mounts_kp);
-            if (ret == 0) {
-                hooked_mounts = true;
-                success_count++;
-                pr_info("Hooked %s at %px\n", 
-                        mounts_symbols[i], (void *)mounts_show_addr);
-                break;
-            }
-        }
-    }
-
-    if (!hooked_mounts) {
-        pr_warn("mounts_show not found\n");
-    }
-
-    /* ================================================
-     * 3. 显示结果
-     * ================================================ */
     pr_info("===========================================\n");
-    pr_info("Hiding status:\n");
-    pr_info("   - /proc/self/mountinfo: %s\n", 
-            hooked_mountinfo ? "HIDDEN" : "FAILED");
-    pr_info("   - /proc/mounts:          %s\n", 
-            hooked_mounts ? "HIDDEN" : "FAILED");
-    
-    if (success_count == 0) {
-        pr_err("No functions hooked! Module will not work.\n");
-        return -ENOENT;
-    }
-    
-    pr_info("%d function(s) hooked successfully\n", success_count);
+    pr_info("Usage: cat /proc/mount_query\n");
+    pr_info("Check: dmesg | tail -20\n");
     pr_info("===========================================\n");
     
     return 0;
 }
 
 /* 模块退出 */
-static void __exit hide_mount_table_exit(void)
+static void __exit mount_query_exit(void)
 {
-    pr_info("===========================================\n");
-    pr_info("Unloading hide_mount module...\n");
-    
-    if (hooked_mountinfo) {
-        unregister_kprobe(&seq_mounts_kp);
-        pr_info("Unhooked show_mountinfo\n");
+    if (hooked) {
+        unregister_kprobe(&kp);
+        pr_info("Unhooked show_mountinfo");
     }
     
-    if (hooked_mounts) {
-        unregister_kprobe(&seq_mounts_kp);
-        pr_info("Unhooked mounts_show\n");
+    if (proc_entry) {
+        proc_remove(proc_entry);
+        pr_info("Removed /proc/mount_query");
     }
     
-    pr_info("All hooks removed, mount table restored\n");
-    pr_info("===========================================\n");
+    pr_info("Mount Query Module unloaded");
 }
 
-module_init(hide_mount_table_init);
-module_exit(hide_mount_table_exit);
+module_init(mount_query_init);
+module_exit(mount_query_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Completely hide /proc/mounts & /proc/self/mountinfo for kernel 6.1.75");
+MODULE_DESCRIPTION("Mount Table Query for Kernel 6.1.75");
 MODULE_AUTHOR("Your Name");
 MODULE_VERSION("1.0");
