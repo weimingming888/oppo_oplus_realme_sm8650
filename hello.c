@@ -11,6 +11,7 @@ static unsigned long get_printk_addr(void)
     unsigned long addr = 0;
     loff_t pos = 0;
     char *p;
+    int ret;
     
     f = filp_open("/proc/kallsyms", O_RDONLY, 0);
     if (IS_ERR(f)) return 0;
@@ -21,8 +22,14 @@ static unsigned long get_printk_addr(void)
         return 0;
     }
     
-    kernel_read(f, buf, 65535, &pos);
+    ret = kernel_read(f, buf, 65535, &pos);
     filp_close(f, NULL);
+    
+    if (ret <= 0) {
+        kfree(buf);
+        return 0;
+    }
+    buf[ret] = '\0';
     
     p = buf;
     while (p && *p) {
@@ -50,9 +57,11 @@ static unsigned long get_printk_addr(void)
 static int __init init(void)
 {
     unsigned long addr = get_printk_addr();
+    int (*p)(const char *fmt, ...);
+    
     if (!addr) return -ENOENT;
     
-    int (*p)(const char *fmt, ...) = (int (*)(const char *fmt, ...))addr;
+    p = (int (*)(const char *fmt, ...))addr;
     p("成功找到地址: 0x%lx\n", addr);
     return 0;
 }
