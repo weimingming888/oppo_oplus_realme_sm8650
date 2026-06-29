@@ -85,9 +85,11 @@ static int take_snapshot(void)
 /* 检查是否是新增的挂载点 */
 static int is_new_mount(const char *line)
 {
+    int i;
+    
     if (!snapshot_taken || !snapshot) return 1;
     
-    for (int i = 0; i < snapshot_count; i++) {
+    for (i = 0; i < snapshot_count; i++) {
         if (snapshot[i] && strcmp(snapshot[i], line) == 0) {
             return 0;  /* 已存在 */
         }
@@ -102,8 +104,9 @@ static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
     char *buf;
     char *p_buf;
     char *new_buf;
-    int new_len = 0;
-    unsigned long addr;
+    char *end;
+    char line[512];
+    int len;
     
 #ifdef CONFIG_ARM64
     m = (struct seq_file *)regs->regs[0];
@@ -122,10 +125,7 @@ static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
     
     p_buf = buf;
     while (p_buf && *p_buf) {
-        char *end = strchr(p_buf, '\n');
-        char line[512];
-        int len;
-        
+        end = strchr(p_buf, '\n');
         if (end) {
             len = end - p_buf;
             if (len < 512) {
@@ -183,11 +183,13 @@ static int __init init(void)
 
 static void __exit exit(void)
 {
+    int i;
+    
     unregister_kprobe(&kp);
     
     /* 释放快照内存 */
     if (snapshot) {
-        for (int i = 0; i < snapshot_count; i++) {
+        for (i = 0; i < snapshot_count; i++) {
             if (snapshot[i]) kfree(snapshot[i]);
         }
         kfree(snapshot);
