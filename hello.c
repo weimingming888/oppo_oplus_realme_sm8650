@@ -52,11 +52,9 @@ static unsigned long find_string_in_memory(const char *str)
     pr_info("Searching for '%s' in memory (0x%lx - 0x%lx)\n",
             str, SEARCH_START, SEARCH_END);
     
-    /* 为了性能，每次跳转 4 字节而不是 1 字节 */
     for (addr = SEARCH_START; addr < end; addr += 4) {
         char buf[64];
         int ret;
-        unsigned long i;
         
         ret = safe_read_mem(addr, buf, len + 1);
         if (ret != 0)
@@ -64,13 +62,11 @@ static unsigned long find_string_in_memory(const char *str)
         
         buf[len] = '\0';
         
-        /* 比较字符串 */
         if (memcmp(buf, str, len) == 0) {
             char next;
             if (__get_user(next, (char *)(addr + len)))
                 continue;
             
-            /* 确保是完整的符号名 */
             if (next == '\0' || next == ' ' || next == '\t' || next == '\n') {
                 match_count++;
                 pr_info("Found '%s' at 0x%lx (match #%d)\n", 
@@ -95,7 +91,6 @@ static unsigned long find_symbol_by_search(const char *sym_name)
     if (!str_addr)
         return 0;
     
-    /* 在字符串前后搜索符号表结构 */
     start = (str_addr > 4096) ? (str_addr - 4096) : SEARCH_START;
     end = str_addr + 4096;
     
@@ -109,7 +104,6 @@ static unsigned long find_symbol_by_search(const char *sym_name)
         if (__get_user(val2, (unsigned long *)(addr + 8)))
             continue;
         
-        /* 检查 val2 是否指向符号名字符串 */
         if (val2 == str_addr) {
             if (val1 >= SEARCH_START && val1 < SEARCH_END) {
                 pr_info("Found %s at 0x%lx\n", sym_name, val1);
@@ -130,7 +124,6 @@ static int find_all_symbols(void)
     
     pr_info("=== Searching for kernel symbols ===\n");
     
-    /* 查找 filp_open */
     addr = find_symbol_by_search("filp_open");
     if (addr) {
         my_filp_open = (filp_open_t)addr;
@@ -139,7 +132,6 @@ static int find_all_symbols(void)
         ret = -1;
     }
     
-    /* 查找 filp_close */
     addr = find_symbol_by_search("filp_close");
     if (addr) {
         my_filp_close = (filp_close_t)addr;
@@ -148,7 +140,6 @@ static int find_all_symbols(void)
         ret = -1;
     }
     
-    /* 查找 kernel_read，如果找不到就找 vfs_read */
     addr = find_symbol_by_search("kernel_read");
     if (!addr) {
         pr_info("kernel_read not found, trying vfs_read...\n");
@@ -162,7 +153,6 @@ static int find_all_symbols(void)
         ret = -1;
     }
     
-    /* 打印结果 */
     pr_info("=== Search results ===\n");
     pr_info("filp_open:   %s (0x%px)\n", 
             my_filp_open ? "FOUND" : "NOT FOUND", my_filp_open);
@@ -189,7 +179,6 @@ static void test_file_read(void)
     
     pr_info("=== Testing file read ===\n");
     
-    /* 尝试打开 /proc/version */
     file = my_filp_open("/proc/version", O_RDONLY, 0);
     if (IS_ERR(file)) {
         pr_err("Failed to open /proc/version: %ld\n", PTR_ERR(file));
@@ -221,26 +210,22 @@ static int __init hello_init(void)
 {
     pr_info("=== Hello module loaded ===\n");
     
-    /* 设置搜索范围（使用 _stext 和 _etext） */
     SEARCH_START = (unsigned long)_stext;
     SEARCH_END = (unsigned long)_etext;
     
     pr_info("Search range: 0x%lx - 0x%lx\n", SEARCH_START, SEARCH_END);
     
-    /* 如果 _stext/_etext 不可用，使用固定范围 */
     if (SEARCH_START == 0 || SEARCH_END == 0 || SEARCH_START >= SEARCH_END) {
         pr_warn("_stext/_etext not available, using fallback range\n");
         SEARCH_START = 0xffffffc000000000ULL;
         SEARCH_END = 0xffffffc100000000ULL;
     }
     
-    /* 自动查找所有符号 */
     if (find_all_symbols() != 0) {
         pr_err("Failed to find all required symbols\n");
         return -ENOENT;
     }
     
-    /* 测试文件操作 */
     test_file_read();
     
     return 0;
