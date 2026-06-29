@@ -11,7 +11,8 @@ static int hook_count = 0;
 
 /* 要隐藏的关键词 */
 static const char *hide_keywords[] = {
-    "/sdcard",
+    "/mnt/user",
+"/sdcard",
     "/storage",
     "/mnt",
     "/usb",
