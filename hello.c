@@ -1,172 +1,107 @@
 #include <linux/module.h>
-#include <linux/kprobes.h>
-#include <linux/seq_file.h>
-#include <linux/string.h>
+#include <linux/kallsyms.h>
+#include <linux/fs.h>
+#include <linux/fcntl.h>
+#include <linux/uaccess.h>
 #include <linux/slab.h>
 
-#define MAX_HOOKS 10
+/* 定义函数指针类型 */
+typedef struct file *(*filp_open_t)(const char *, int, umode_t);
+typedef int (*filp_close_t)(struct file *, fl_owner_t);
+typedef ssize_t (*kernel_read_t)(struct file *, void *, size_t, loff_t *);
 
-static struct kprobe kp[MAX_HOOKS];
-static int hook_count = 0;
+static filp_open_t my_filp_open = NULL;
+static filp_close_t my_filp_close = NULL;
+static kernel_read_t my_kernel_read = NULL;
 
-/* 要隐藏的关键词 - 使用精确匹配 */
-static const char *hide_keywords[] = {
-    "/mnt/user/0/emulated/0/图标",  // ← 精确匹配这条
-    "/mnt/installer",
-    "/mnt/androidwritable",
-    "/storage/emulated",
-    "123云盘",
-    "/mnt/user",
-    "/sdcard",
-    "/storage",
-    "/mnt",
-    "/usb",
-    "/pass_through",
-    "/图标",
-    "fuse",
-    NULL
-};
-
-static int should_hide(const char *line)
+/* 读取文件内容并打印 */
+static void read_file_content(struct file *file)
 {
-    int i;
-    if (!line) return 0;
-    
-    for (i = 0; hide_keywords[i] != NULL; i++) {
-        if (strstr(line, hide_keywords[i])) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int filter_handler(struct kprobe *p, struct pt_regs *regs)
-{
-    struct seq_file *m;
     char *buf;
-    char *new_buf;
-    char *p_buf;
-    char *end;
-    char line[1024];  // ← 增大缓冲区
-    int len;
-    int total_len;
-    int hidden_count;
+    ssize_t ret;
+    loff_t pos = 0;
     
-#ifdef CONFIG_ARM64
-    m = (struct seq_file *)regs->regs[0];
-#else
-    m = (struct seq_file *)regs->di;
-#endif
+    if (!file || !my_kernel_read)
+        return;
+    
+    buf = kmalloc(256, GFP_KERNEL);
+    if (!buf) {
+        printk(KERN_ERR "Failed to allocate buffer\n");
+        return;
+    }
+    
+    ret = my_kernel_read(file, buf, 255, &pos);
+    if (ret > 0) {
+        buf[ret] = '\0';
+        printk(KERN_INFO "File content: %s\n", buf);
+    } else {
+        printk(KERN_ERR "Read failed: %zd\n", ret);
+    }
+    
+    kfree(buf);
+}
 
-    if (!m || !m->buf || m->count == 0) return 0;
+/* 模块初始化函数 */
+static int __init file_open_test_init(void)
+{
+    struct file *file;
+    const char *path = "/data/local/tmp/test.txt";
     
-    buf = m->buf;
+    printk(KERN_INFO "File open test module loaded\n");
     
-    new_buf = kmalloc(65536, GFP_ATOMIC);
-    if (!new_buf) return 0;
-    new_buf[0] = '\0';
-    total_len = 0;
-    hidden_count = 0;
+    /* 查找符号地址 */
+    my_filp_open = (filp_open_t)kallsyms_lookup_name("filp_open");
+    my_filp_close = (filp_close_t)kallsyms_lookup_name("filp_close");
+    my_kernel_read = (kernel_read_t)kallsyms_lookup_name("kernel_read");
     
-    p_buf = buf;
-    while (p_buf && *p_buf) {
-        end = strchr(p_buf, '\n');
-        if (end) {
-            len = end - p_buf;
-            if (len < 1024) {
-                strncpy(line, p_buf, len);
-                line[len] = '\0';
-                
-                /* 调试：打印每行 */
-                if (strstr(line, "图标") || strstr(line, "fuse")) {
-                    pr_info("🔍 检查行: %s\n", line);
-                }
-                
-                if (!should_hide(line)) {
-                    strcat(new_buf, line);
-                    strcat(new_buf, "\n");
-                    total_len += len + 1;
-                } else {
-                    hidden_count++;
-                    pr_info("✅ 隐藏: %s\n", line);
-                }
-            }
-            p_buf = end + 1;
-        } else {
-            break;
+    if (!my_filp_open) {
+        printk(KERN_ERR "filp_open not found\n");
+        return -EFAULT;
+    }
+    if (!my_filp_close) {
+        printk(KERN_ERR "filp_close not found\n");
+        return -EFAULT;
+    }
+    if (!my_kernel_read) {
+        printk(KERN_WARNING "kernel_read not found, trying vfs_read\n");
+        my_kernel_read = (kernel_read_t)kallsyms_lookup_name("vfs_read");
+        if (!my_kernel_read) {
+            printk(KERN_ERR "vfs_read not found either\n");
+            return -EFAULT;
         }
     }
     
-    if (hidden_count > 0) {
-        pr_info("隐藏了 %d 个挂载点 (%s)\n", hidden_count, p->symbol_name);
+    printk(KERN_INFO "Symbols found: filp_open=0x%p, filp_close=0x%p, read=0x%p\n",
+           my_filp_open, my_filp_close, my_kernel_read);
+    
+    /* 打开文件 */
+    file = my_filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        printk(KERN_ERR "Failed to open file: %ld\n", PTR_ERR(file));
+        return -ENOENT;
     }
     
-    if (total_len > 0) {
-        memcpy(buf, new_buf, total_len + 1);
-        m->count = total_len;
-    } else {
-        buf[0] = '\0';
-        m->count = 0;
-    }
+    printk(KERN_INFO "File opened successfully: %p\n", file);
     
-    kfree(new_buf);
+    /* 读取文件内容 */
+    read_file_content(file);
+    
+    /* 关闭文件 */
+    my_filp_close(file, NULL);
+    printk(KERN_INFO "File closed\n");
+    
     return 0;
 }
 
-static int register_hooks(void)
+/* 模块清理函数 */
+static void __exit file_open_test_exit(void)
 {
-    const char *symbols[] = {
-        "show_mountinfo",
-        "show_vfsmnt",
-        "mounts_show",
-        NULL
-    };
-    
-    int i;
-    int success = 0;
-    
-    for (i = 0; symbols[i] != NULL && hook_count < MAX_HOOKS; i++) {
-        kp[hook_count].pre_handler = filter_handler;
-        kp[hook_count].symbol_name = symbols[i];
-        
-        if (register_kprobe(&kp[hook_count]) == 0) {
-            pr_info("✅ %s 已拦截\n", symbols[i]);
-            hook_count++;
-            success++;
-        }
-    }
-    
-    return success;
+    printk(KERN_INFO "File open test module unloaded\n");
 }
 
-static int __init init(void)
-{
-    int i;
-    
-    pr_info("=== 挂载点过滤器 ===\n");
-    pr_info("隐藏关键词:\n");
-    for (i = 0; hide_keywords[i] != NULL; i++) {
-        pr_info("  - %s\n", hide_keywords[i]);
-    }
-    
-    if (register_hooks() > 0) {
-        pr_info("✅ 已启用 (%d 个钩子)\n", hook_count);
-        return 0;
-    }
-    
-    pr_err("注册失败\n");
-    return -ENOENT;
-}
+module_init(file_open_test_init);
+module_exit(file_open_test_exit);
 
-static void __exit exit(void)
-{
-    int i;
-    for (i = 0; i < hook_count; i++) {
-        unregister_kprobe(&kp[i]);
-    }
-    pr_info("✅ 已恢复\n");
-}
-
-module_init(init);
-module_exit(exit);
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Test");
+MODULE_DESCRIPTION("Test file open via kallsyms");
