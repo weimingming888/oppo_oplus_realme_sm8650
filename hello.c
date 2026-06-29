@@ -3,52 +3,36 @@
 #include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/slab.h>
-#include <linux/fs.h>
-
-static struct kprobe kp;
 
 static const char *hide_keywords[] = {
     "/sdcard",
     "/storage",
     "cpu",
+    "/usb",
+    
     NULL
 };
 
-/* 打印当前挂载信息到内核日志（调试用） */
-static void debug_mountinfo(struct seq_file *m)
+/* 在函数使用前先声明 */
+static int should_hide(const char *line);
+
+/* 检查是否应该隐藏 */
+static int should_hide(const char *line)
 {
-    char *buf;
-    char *p_buf;
-    char *end;
-    char line[256];
-    int len;
+    int i;
     
-    if (!m || !m->buf || !m->count) {
-        pr_info("mountinfo: 空\n");
-        return;
-    }
+    if (!line) return 0;
     
-    buf = m->buf;
-    pr_info("=== mountinfo 内容 (%zu 字节) ===\n", m->count);
-    
-    p_buf = buf;
-    while (p_buf && *p_buf) {
-        end = strchr(p_buf, '\n');
-        if (end) {
-            len = end - p_buf;
-            if (len < 256) {
-                strncpy(line, p_buf, len);
-                line[len] = '\0';
-                pr_info("  %s\n", line);
-            }
-            p_buf = end + 1;
-        } else {
-            break;
+    for (i = 0; hide_keywords[i] != NULL; i++) {
+        if (strstr(line, hide_keywords[i])) {
+            return 1;
         }
     }
+    return 0;
 }
 
-static int pre_handler(struct kprobe *p, struct pt_regs *regs)
+/* 通用过滤函数 */
+static int filter_mountinfo(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
     char *buf;
@@ -58,7 +42,6 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
     char line[512];
     int len;
     int total_len;
-    int hidden_count;
     
 #ifdef CONFIG_ARM64
     m = (struct seq_file *)regs->regs[0];
@@ -66,13 +49,9 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
     m = (struct seq_file *)regs->di;
 #endif
 
-    if (!m || !m->buf || !m->count) {
-        pr_info("mountinfo: 空或无效\n");
-        return 0;
-    }
+    if (!m || !m->buf || !m->count) return 0;
     
     buf = m->buf;
-    hidden_count = 0;
     
     new_buf = kmalloc(65536, GFP_ATOMIC);
     if (!new_buf) return 0;
@@ -92,18 +71,12 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
                     strcat(new_buf, line);
                     strcat(new_buf, "\n");
                     total_len += len + 1;
-                } else {
-                    hidden_count++;
                 }
             }
             p_buf = end + 1;
         } else {
             break;
         }
-    }
-    
-    if (hidden_count > 0) {
-        pr_info("隐藏了 %d 个挂载点\n", hidden_count);
     }
     
     if (total_len > 0) {
@@ -118,11 +91,19 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
+static struct kprobe kp;
+
 static int __init init(void)
 {
-    pr_info("=== 挂载点过滤器 ===\n");
+    int i;
     
-    kp.pre_handler = pre_handler;
+    pr_info("=== 挂载点过滤器 ===\n");
+    pr_info("隐藏关键词:\n");
+    for (i = 0; hide_keywords[i] != NULL; i++) {
+        pr_info("  - %s\n", hide_keywords[i]);
+    }
+    
+    kp.pre_handler = filter_mountinfo;
     kp.symbol_name = "show_mountinfo";
     
     if (register_kprobe(&kp) == 0) {
@@ -137,6 +118,12 @@ static int __init init(void)
         return 0;
     }
     
+    kp.symbol_name = "seq_show_mounts";
+    if (register_kprobe(&kp) == 0) {
+        pr_info("✅ seq_show_mounts 已拦截\n");
+        return 0;
+    }
+    
     pr_err("所有钩子注册失败\n");
     return -ENOENT;
 }
@@ -144,7 +131,7 @@ static int __init init(void)
 static void __exit exit(void)
 {
     unregister_kprobe(&kp);
-    pr_info("✅ 已恢复\n");
+    pr_info("✅ 过滤器已禁用\n");
 }
 
 module_init(init);
