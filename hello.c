@@ -1,15 +1,51 @@
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
+#include <linux/string.h>
+#include <linux/slab.h>
 
 #define MAX_HOOKS 10
 
 static struct kprobe kp[MAX_HOOKS];
 static int hook_count = 0;
 
-static int clear_handler(struct kprobe *p, struct pt_regs *regs)
+/* 要隐藏的关键词 */
+static const char *hide_keywords[] = {
+    "/sdcard",
+    "/storage",
+    "/mnt",
+    "/usb",
+    "/pass_through",
+    "/user",
+    "/图标",              // ← 添加这个，隐藏包含 "图标" 的挂载点
+    "/installer",         // ← 添加这个
+    "fuse",               // ← 隐藏所有 fuse 挂载点
+    NULL
+};
+
+static int should_hide(const char *line)
+{
+    int i;
+    if (!line) return 0;
+    for (i = 0; hide_keywords[i] != NULL; i++) {
+        if (strstr(line, hide_keywords[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int filter_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
+    char *buf;
+    char *new_buf;
+    char *p_buf;
+    char *end;
+    char line[512];
+    int len;
+    int total_len;
+    int hidden_count;
     
 #ifdef CONFIG_ARM64
     m = (struct seq_file *)regs->regs[0];
@@ -17,25 +53,63 @@ static int clear_handler(struct kprobe *p, struct pt_regs *regs)
     m = (struct seq_file *)regs->di;
 #endif
 
-    if (!m || !m->buf) return 0;
+    if (!m || !m->buf || m->count == 0) return 0;
     
-    m->buf[0] = '\0';
-    m->count = 0;
+    buf = m->buf;
     
+    new_buf = kmalloc(65536, GFP_ATOMIC);
+    if (!new_buf) return 0;
+    new_buf[0] = '\0';
+    total_len = 0;
+    hidden_count = 0;
+    
+    p_buf = buf;
+    while (p_buf && *p_buf) {
+        end = strchr(p_buf, '\n');
+        if (end) {
+            len = end - p_buf;
+            if (len < 512) {
+                strncpy(line, p_buf, len);
+                line[len] = '\0';
+                
+                if (!should_hide(line)) {
+                    strcat(new_buf, line);
+                    strcat(new_buf, "\n");
+                    total_len += len + 1;
+                } else {
+                    hidden_count++;
+                }
+            }
+            p_buf = end + 1;
+        } else {
+            break;
+        }
+    }
+    
+    if (hidden_count > 0) {
+        pr_info("隐藏了 %d 个挂载点 (%s)\n", hidden_count, p->symbol_name);
+    }
+    
+    if (total_len > 0) {
+        memcpy(buf, new_buf, total_len + 1);
+        m->count = total_len;
+    } else {
+        buf[0] = '\0';
+        m->count = 0;
+    }
+    
+    kfree(new_buf);
     return 0;
 }
 
 static int register_hooks(void)
 {
-    /* 更多可能的函数名 */
     const char *symbols[] = {
-        "show_mountinfo",      // /proc/self/mountinfo
-        "mounts_show",         // /proc/mounts
-        "show_mounts",         // 备选
-        "seq_show_mounts",     // 备选
-        "mountinfo_show",      // 备选
-        "proc_mounts_show",    // 备选
-        "show_vfsmnt",         // 旧内核
+        "show_mountinfo",
+        "show_vfsmnt",
+        "mounts_show",
+        "show_mounts",
+        "seq_show_mounts",
         NULL
     };
     
@@ -43,11 +117,11 @@ static int register_hooks(void)
     int success = 0;
     
     for (i = 0; symbols[i] != NULL && hook_count < MAX_HOOKS; i++) {
-        kp[hook_count].pre_handler = clear_handler;
+        kp[hook_count].pre_handler = filter_handler;
         kp[hook_count].symbol_name = symbols[i];
         
         if (register_kprobe(&kp[hook_count]) == 0) {
-            pr_info("✅ %s 已清空\n", symbols[i]);
+            pr_info("✅ %s 已拦截\n", symbols[i]);
             hook_count++;
             success++;
         }
@@ -58,8 +132,13 @@ static int register_hooks(void)
 
 static int __init init(void)
 {
-    pr_info("=== 挂载表实时清空 ===\n");
-    pr_info("⚠️  所有挂载表读取都将返回空\n");
+    int i;
+    
+    pr_info("=== 挂载点过滤器 ===\n");
+    pr_info("隐藏关键词:\n");
+    for (i = 0; hide_keywords[i] != NULL; i++) {
+        pr_info("  - %s\n", hide_keywords[i]);
+    }
     
     if (register_hooks() > 0) {
         pr_info("✅ 已启用 (%d 个钩子)\n", hook_count);
