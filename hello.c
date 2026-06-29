@@ -1,196 +1,105 @@
 #include <linux/module.h>
 #include <linux/kprobes.h>
-#include <linux/seq_file.h>
 #include <linux/fs.h>
-#include <linux/slab.h>
-#include <linux/string.h>
+#include <linux/mount.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/nodemask.h>
 #include <linux/uaccess.h>
+#include <linux/seq_file.h>
+#include <linux/list.h>
+#include <linux/sched.h>
 
-static struct kprobe kp;
-static char **snapshot = NULL;
-static int snapshot_count = 0;
-static bool snapshot_taken = false;
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Hide all post root mount points, no blacklist");
 
-/* 读取当前挂载点列表（内核 6.1+ 兼容） */
-static int take_snapshot(void)
+static struct kprobe filp_open_kp;
+static struct vfsmount *root_mnt; // 保存系统初始根挂载
+
+// 判断当前路径是否落在「非根的后续挂载点」
+static bool is_post_mount_path(const char *user_path)
 {
-    struct file *f;
-    char *buf;
-    char *p;
-    int count = 0;
-    loff_t pos = 0;
-    int ret;
-    
-    f = filp_open("/proc/self/mountinfo", O_RDONLY, 0);
-    if (IS_ERR(f)) return -1;
-    
-    buf = kmalloc(65536, GFP_KERNEL);
-    if (!buf) {
-        filp_close(f, NULL);
-        return -1;
-    }
-    
-    /* 内核 6.1+ 直接使用 kernel_read */
-    ret = kernel_read(f, buf, 65535, &pos);
-    filp_close(f, NULL);
-    
-    if (ret <= 0) {
-        kfree(buf);
-        return -1;
-    }
-    buf[ret] = '\0';
-    
-    /* 统计行数 */
-    p = buf;
-    while (p && *p) {
-        char *end = strchr(p, '\n');
-        if (end) {
-            count++;
-            p = end + 1;
-        } else {
-            break;
+    struct mount *mnt;
+    struct mount *root_mount = mnt_from_mnt(root_mnt);
+    char tmp_buf[512];
+    const char *mnt_path;
+
+    // 遍历全局挂载链表
+    list_for_each_entry(mnt, &mnt_list, mnt_list) {
+        // 跳过根文件系统挂载
+        if (mnt == root_mount)
+            continue;
+
+        // 获取挂载点完整路径
+        d_path(&mnt->mnt_mountpoint, tmp_buf, sizeof(tmp_buf));
+        mnt_path = tmp_buf;
+
+        // 空路径跳过
+        if (!mnt_path || strlen(mnt_path) == 0)
+            continue;
+
+        // 匹配：访问路径以该挂载点开头
+        if (!strncmp(user_path, mnt_path, strlen(mnt_path))) {
+            return true;
         }
     }
-    
-    snapshot_count = count;
-    snapshot = kmalloc(count * sizeof(char *), GFP_KERNEL);
-    if (!snapshot) {
-        kfree(buf);
-        return -1;
-    }
-    
-    /* 保存每一行 */
-    count = 0;
-    p = buf;
-    while (p && *p && count < snapshot_count) {
-        char *end = strchr(p, '\n');
-        if (end) *end = '\0';
-        
-        snapshot[count] = kmalloc(strlen(p) + 1, GFP_KERNEL);
-        if (snapshot[count]) {
-            strcpy(snapshot[count], p);
-            count++;
-        }
-        p = end + 1;
-    }
-    
-    snapshot_taken = true;
-    kfree(buf);
-    return count;
+    return false;
 }
 
-/* 检查是否是新增的挂载点 */
-static int is_new_mount(const char *line)
+// filp_open 前置拦截钩子
+static int pre_hook_filp_open(struct kprobe *p, struct pt_regs *regs)
 {
-    int i;
-    
-    if (!snapshot_taken || !snapshot) return 1;
-    
-    for (i = 0; i < snapshot_count; i++) {
-        if (snapshot[i] && strcmp(snapshot[i], line) == 0) {
-            return 0;
-        }
-    }
-    return 1;
-}
+    // ARM64: x0 = pathname
+    const char __user *u_path = (const char __user *)regs->regs[0];
+    char k_path[256] = {0};
+    long cp_ret;
 
-/* 拦截 show_mountinfo，过滤掉新增的挂载点 */
-static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
-{
-    struct seq_file *m;
-    char *buf;
-    char *p_buf;
-    char *new_buf;
-    char *end;
-    char line[512];
-    int len;
-    
-#ifdef CONFIG_ARM64
-    m = (struct seq_file *)regs->regs[0];
-#else
-    m = (struct seq_file *)regs->di;
-#endif
+    cp_ret = strncpy_from_user(k_path, u_path, sizeof(k_path) - 1);
+    if (cp_ret < 0)
+        return 0;
 
-    if (!m || !m->buf || !m->count) return 0;
-    
-    buf = m->buf;
-    
-    /* 构建新的输出（只包含快照中的挂载点） */
-    new_buf = kmalloc(65536, GFP_ATOMIC);
-    if (!new_buf) return 0;
-    new_buf[0] = '\0';
-    
-    p_buf = buf;
-    while (p_buf && *p_buf) {
-        end = strchr(p_buf, '\n');
-        if (end) {
-            len = end - p_buf;
-            if (len < 512) {
-                strncpy(line, p_buf, len);
-                line[len] = '\0';
-                
-                if (!is_new_mount(line)) {
-                    strcat(new_buf, line);
-                    strcat(new_buf, "\n");
-                }
-            }
-            p_buf = end + 1;
-        } else {
-            break;
-        }
+    // 命中任意后期挂载点，直接屏蔽
+    if (is_post_mount_path(k_path)) {
+        pr_info("[hide_mnt] Block post mount access: %s\n", k_path);
+        // 跳过原函数，返回文件不存在
+        regs->regs[0] = (unsigned long)ERR_PTR(-ENOENT);
+        p->flags |= KPROBE_FLAG_SKIP_FUNCTION;
     }
-    
-    /* 替换原有内容 */
-    memcpy(buf, new_buf, strlen(new_buf) + 1);
-    m->count = strlen(new_buf);
-    
-    kfree(new_buf);
     return 0;
 }
 
-static int __init init(void)
+static int __init hide_mnt_init(void)
 {
     int ret;
-    
-    pr_info("=== 挂载点过滤器 ===\n");
-    
-    ret = take_snapshot();
+    struct path root_p;
+
+    // 保存系统启动初始根挂载
+    get_task_root(current, &root_p);
+    root_mnt = root_p.mnt;
+    mntget(root_mnt);
+
+    // 注册kprobe挂钩filp_open
+    memset(&filp_open_kp, 0, sizeof(filp_open_kp));
+    filp_open_kp.symbol_name = "filp_open";
+    filp_open_kp.pre_handler = pre_hook_filp_open;
+
+    ret = register_kprobe(&filp_open_kp);
     if (ret < 0) {
-        pr_err("快照失败\n");
-        return -ENOENT;
+        pr_err("register filp_open kprobe failed, err:%d\n", ret);
+        mntput(root_mnt);
+        return ret;
     }
-    pr_info("已记录 %d 个挂载点\n", ret);
-    
-    kp.pre_handler = pre_show_mountinfo;
-    kp.symbol_name = "show_mountinfo";
-    
-    if (register_kprobe(&kp) == 0) {
-        pr_info("✅ 过滤器已启用\n");
-        pr_info("  已有挂载: %d 个（显示）\n", snapshot_count);
-        pr_info("  新增挂载: 隐藏\n");
-        return 0;
-    }
-    
-    pr_err("注册失败\n");
-    return -ENOENT;
+
+    pr_info("Module loaded: all post root mounts hidden\n");
+    return 0;
 }
 
-static void __exit exit(void)
+static void __exit hide_mnt_exit(void)
 {
-    int i;
-    
-    unregister_kprobe(&kp);
-    
-    if (snapshot) {
-        for (i = 0; i < snapshot_count; i++) {
-            if (snapshot[i]) kfree(snapshot[i]);
-        }
-        kfree(snapshot);
-    }
-    
-    pr_info("✅ 过滤器已禁用\n");
+    unregister_kprobe(&filp_open_kp);
+    mntput(root_mnt);
+    pr_info("Module unloaded, mount visibility restored\n");
 }
 
-module_init(init);
-module_exit(exit);
-MODULE_LICENSE("GPL");
+module_init(hide_mnt_init);
+module_exit(hide_mnt_exit);
