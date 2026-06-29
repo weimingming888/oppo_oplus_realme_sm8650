@@ -7,9 +7,3 @@ all:
 
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
-
-install:
-	sudo insmod hello.ko
-
-remove:
-	sudo rmmod hello
