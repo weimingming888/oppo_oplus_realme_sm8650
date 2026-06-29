@@ -8,10 +8,16 @@ static unsigned long get_printk_addr(void)
 {
     struct file *f;
     char *buf;
-    unsigned long addr = 0;
-    loff_t pos = 0;
+    unsigned long addr;
+    loff_t pos;
     char *p;
+    char *end;
+    char *name;
+    char a[17];
     int ret;
+    
+    addr = 0;
+    pos = 0;
     
     f = filp_open("/proc/kallsyms", O_RDONLY, 0);
     if (IS_ERR(f)) return 0;
@@ -33,14 +39,13 @@ static unsigned long get_printk_addr(void)
     
     p = buf;
     while (p && *p) {
-        char *end = strchr(p, '\n');
+        end = strchr(p, '\n');
         if (end) *end = '\0';
         
-        char *name = strrchr(p, ' ');
+        name = strrchr(p, ' ');
         if (name) {
             name++;
             if (strcmp(name, "_printk") == 0) {
-                char a[17];
                 strncpy(a, p, 16);
                 a[16] = '\0';
                 addr = simple_strtoul(a, NULL, 16);
@@ -56,9 +61,10 @@ static unsigned long get_printk_addr(void)
 
 static int __init init(void)
 {
-    unsigned long addr = get_printk_addr();
+    unsigned long addr;
     int (*p)(const char *fmt, ...);
     
+    addr = get_printk_addr();
     if (!addr) return -ENOENT;
     
     p = (int (*)(const char *fmt, ...))addr;
