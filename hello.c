@@ -11,7 +11,7 @@ static char **snapshot = NULL;
 static int snapshot_count = 0;
 static bool snapshot_taken = false;
 
-/* 读取当前挂载点列表 */
+/* 读取当前挂载点列表（内核 6.1+ 兼容） */
 static int take_snapshot(void)
 {
     struct file *f;
@@ -19,7 +19,6 @@ static int take_snapshot(void)
     char *p;
     int count = 0;
     loff_t pos = 0;
-    mm_segment_t old_fs;
     int ret;
     
     f = filp_open("/proc/self/mountinfo", O_RDONLY, 0);
@@ -31,10 +30,8 @@ static int take_snapshot(void)
         return -1;
     }
     
-    old_fs = get_fs();
-    set_fs(KERNEL_DS);
-    ret = vfs_read(f, (char __user *)buf, 65535, &pos);
-    set_fs(old_fs);
+    /* 内核 6.1+ 直接使用 kernel_read */
+    ret = kernel_read(f, buf, 65535, &pos);
     filp_close(f, NULL);
     
     if (ret <= 0) {
@@ -91,10 +88,10 @@ static int is_new_mount(const char *line)
     
     for (i = 0; i < snapshot_count; i++) {
         if (snapshot[i] && strcmp(snapshot[i], line) == 0) {
-            return 0;  /* 已存在 */
+            return 0;
         }
     }
-    return 1;  /* 新增的 */
+    return 1;
 }
 
 /* 拦截 show_mountinfo，过滤掉新增的挂载点 */
@@ -132,7 +129,6 @@ static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
                 strncpy(line, p_buf, len);
                 line[len] = '\0';
                 
-                /* 只保留快照中已有的挂载点 */
                 if (!is_new_mount(line)) {
                     strcat(new_buf, line);
                     strcat(new_buf, "\n");
@@ -149,7 +145,7 @@ static int pre_show_mountinfo(struct kprobe *p, struct pt_regs *regs)
     m->count = strlen(new_buf);
     
     kfree(new_buf);
-    return 0;  /* 继续执行，但使用修改后的数据 */
+    return 0;
 }
 
 static int __init init(void)
@@ -158,7 +154,6 @@ static int __init init(void)
     
     pr_info("=== 挂载点过滤器 ===\n");
     
-    /* 记录当前挂载点快照 */
     ret = take_snapshot();
     if (ret < 0) {
         pr_err("快照失败\n");
@@ -166,7 +161,6 @@ static int __init init(void)
     }
     pr_info("已记录 %d 个挂载点\n", ret);
     
-    /* 注册 kprobe */
     kp.pre_handler = pre_show_mountinfo;
     kp.symbol_name = "show_mountinfo";
     
@@ -187,7 +181,6 @@ static void __exit exit(void)
     
     unregister_kprobe(&kp);
     
-    /* 释放快照内存 */
     if (snapshot) {
         for (i = 0; i < snapshot_count; i++) {
             if (snapshot[i]) kfree(snapshot[i]);
