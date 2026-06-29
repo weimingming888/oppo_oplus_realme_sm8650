@@ -2,10 +2,13 @@
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
 
-static struct kprobe kp;
+#define MAX_HOOKS 5
 
-/* 直接清空，不做任何判断 */
-static int pre_handler(struct kprobe *p, struct pt_regs *regs)
+static struct kprobe kp[MAX_HOOKS];
+static int hook_count = 0;
+
+/* 每次读取都清空 */
+static int clear_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
     
@@ -17,20 +20,46 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
 
     if (!m || !m->buf) return 0;
     
-    /* 直接清空 */
+    /* 每次调用都清空 */
     m->buf[0] = '\0';
     m->count = 0;
     
     return 0;
 }
 
+static int register_hooks(void)
+{
+    const char *symbols[] = {
+        "show_mountinfo",   // /proc/self/mountinfo
+        "mounts_show",      // /proc/mounts
+        "seq_show_mounts",  // 备选
+        NULL
+    };
+    
+    int i;
+    int success = 0;
+    
+    for (i = 0; symbols[i] != NULL && hook_count < MAX_HOOKS; i++) {
+        kp[hook_count].pre_handler = clear_handler;
+        kp[hook_count].symbol_name = symbols[i];
+        
+        if (register_kprobe(&kp[hook_count]) == 0) {
+            pr_info("✅ %s 已清空\n", symbols[i]);
+            hook_count++;
+            success++;
+        }
+    }
+    
+    return success;
+}
+
 static int __init init(void)
 {
-    kp.pre_handler = pre_handler;
-    kp.symbol_name = "show_mountinfo";
+    pr_info("=== 挂载表实时清空 ===\n");
+    pr_info("⚠️  所有挂载表读取都将返回空\n");
     
-    if (register_kprobe(&kp) == 0) {
-        pr_info("✅ mountinfo 已清空\n");
+    if (register_hooks() > 0) {
+        pr_info("✅ 已启用 (%d 个钩子)\n", hook_count);
         return 0;
     }
     
@@ -40,7 +69,10 @@ static int __init init(void)
 
 static void __exit exit(void)
 {
-    unregister_kprobe(&kp);
+    int i;
+    for (i = 0; i < hook_count; i++) {
+        unregister_kprobe(&kp[i]);
+    }
     pr_info("✅ 已恢复\n");
 }
 
