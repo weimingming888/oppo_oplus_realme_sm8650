@@ -9,18 +9,21 @@
 static struct kprobe kp[MAX_HOOKS];
 static int hook_count = 0;
 
-/* 要隐藏的关键词 */
+/* 要隐藏的关键词 - 使用精确匹配 */
 static const char *hide_keywords[] = {
+    "/mnt/user/0/emulated/0/图标",  // ← 精确匹配这条
+    "/mnt/installer",
+    "/mnt/androidwritable",
+    "/storage/emulated",
+    "123云盘",
     "/mnt/user",
-"/sdcard",
+    "/sdcard",
     "/storage",
     "/mnt",
     "/usb",
     "/pass_through",
-    "/user",
-    "/图标",              // ← 添加这个，隐藏包含 "图标" 的挂载点
-    "/installer",         // ← 添加这个
-    "fuse",               // ← 隐藏所有 fuse 挂载点
+    "/图标",
+    "fuse",
     NULL
 };
 
@@ -28,6 +31,7 @@ static int should_hide(const char *line)
 {
     int i;
     if (!line) return 0;
+    
     for (i = 0; hide_keywords[i] != NULL; i++) {
         if (strstr(line, hide_keywords[i])) {
             return 1;
@@ -43,7 +47,7 @@ static int filter_handler(struct kprobe *p, struct pt_regs *regs)
     char *new_buf;
     char *p_buf;
     char *end;
-    char line[512];
+    char line[1024];  // ← 增大缓冲区
     int len;
     int total_len;
     int hidden_count;
@@ -69,9 +73,14 @@ static int filter_handler(struct kprobe *p, struct pt_regs *regs)
         end = strchr(p_buf, '\n');
         if (end) {
             len = end - p_buf;
-            if (len < 512) {
+            if (len < 1024) {
                 strncpy(line, p_buf, len);
                 line[len] = '\0';
+                
+                /* 调试：打印每行 */
+                if (strstr(line, "图标") || strstr(line, "fuse")) {
+                    pr_info("🔍 检查行: %s\n", line);
+                }
                 
                 if (!should_hide(line)) {
                     strcat(new_buf, line);
@@ -79,6 +88,7 @@ static int filter_handler(struct kprobe *p, struct pt_regs *regs)
                     total_len += len + 1;
                 } else {
                     hidden_count++;
+                    pr_info("✅ 隐藏: %s\n", line);
                 }
             }
             p_buf = end + 1;
@@ -109,8 +119,6 @@ static int register_hooks(void)
         "show_mountinfo",
         "show_vfsmnt",
         "mounts_show",
-        "show_mounts",
-        "seq_show_mounts",
         NULL
     };
     
