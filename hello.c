@@ -2,12 +2,11 @@
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
 
-#define MAX_HOOKS 5
+#define MAX_HOOKS 10
 
 static struct kprobe kp[MAX_HOOKS];
 static int hook_count = 0;
 
-/* 每次读取都清空 */
 static int clear_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
@@ -20,7 +19,6 @@ static int clear_handler(struct kprobe *p, struct pt_regs *regs)
 
     if (!m || !m->buf) return 0;
     
-    /* 每次调用都清空 */
     m->buf[0] = '\0';
     m->count = 0;
     
@@ -29,10 +27,15 @@ static int clear_handler(struct kprobe *p, struct pt_regs *regs)
 
 static int register_hooks(void)
 {
+    /* 更多可能的函数名 */
     const char *symbols[] = {
-        "show_mountinfo",   // /proc/self/mountinfo
-        "mounts_show",      // /proc/mounts
-        "seq_show_mounts",  // 备选
+        "show_mountinfo",      // /proc/self/mountinfo
+        "mounts_show",         // /proc/mounts
+        "show_mounts",         // 备选
+        "seq_show_mounts",     // 备选
+        "mountinfo_show",      // 备选
+        "proc_mounts_show",    // 备选
+        "show_vfsmnt",         // 旧内核
         NULL
     };
     
