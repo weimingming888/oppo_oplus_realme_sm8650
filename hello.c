@@ -6,18 +6,20 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Selective Mount Hider");
-MODULE_DESCRIPTION("Hide mount points containing '图标' (line-level filter)");
+MODULE_DESCRIPTION("Hide mount points containing '图标' (C89 compliant)");
 
 /* ---------- 三个 kprobe ---------- */
 static struct kprobe kp_show_vfsmnt;
 static struct kprobe kp_show_mountinfo;
 static struct kprobe kp_m_show;
 
-/* ---------- 检查一段内存是否包含"图标" (UTF-8: E5 9B BE E6 A0 87) ---------- */
+/* ---------- 检查字节序列是否包含 "图标" (UTF-8) ---------- */
 static int contains_icon(const char *buf, unsigned long len)
 {
-    const unsigned char *p = (const unsigned char *)buf;
-    const unsigned char *end = p + len;
+    const unsigned char *p;
+    const unsigned char *end;
+    p = (const unsigned char *)buf;
+    end = p + len;
 
     while (p + 6 <= end) {
         if (p[0] == 0xE5 && p[1] == 0x9B && p[2] == 0xBE &&
@@ -29,17 +31,26 @@ static int contains_icon(const char *buf, unsigned long len)
     return 0;
 }
 
-/* ---------- 过滤 seq_file 缓冲区中的行 ---------- */
+/* ---------- 过滤 seq_file 缓冲区中的行（删除含"图标"的行） ---------- */
 static void filter_seq_lines(struct seq_file *m)
 {
-    char *buf = m->buf;
-    unsigned long count = m->count;
-    char *src = buf;
-    char *dst = buf;
-    unsigned long src_pos = 0;
-    unsigned long dst_pos = 0;
+    char *buf;
+    unsigned long count;
+    char *src;
+    char *dst;
+    unsigned long src_pos;
+    unsigned long dst_pos;
     char *line_end;
     unsigned long remaining;
+    unsigned long line_len;
+    char *line_start;
+
+    buf = m->buf;
+    count = m->count;
+    src = buf;
+    dst = buf;
+    src_pos = 0;
+    dst_pos = 0;
 
     while (src_pos < count) {
         remaining = count - src_pos;
@@ -47,18 +58,17 @@ static void filter_seq_lines(struct seq_file *m)
         if (!line_end)
             break;
 
-        unsigned long line_len = (line_end - (src + src_pos)) + 1;
-        char *line_start = src + src_pos;
+        line_start = src + src_pos;
+        line_len = (unsigned long)(line_end - line_start) + 1;
 
-        /* 检查这一行是否包含"图标" */
         if (!contains_icon(line_start, line_len)) {
-            /* 保留这一行，必要时移动 */
+            /* 保留该行 */
             if (dst_pos != src_pos) {
                 memmove(dst + dst_pos, line_start, line_len);
             }
             dst_pos += line_len;
         }
-        /* 否则跳过该行（不复制） */
+        /* 否则跳过 */
 
         src_pos += line_len;
     }
@@ -112,7 +122,9 @@ static int register_hook(const char *symbol, struct kprobe *kp)
 static int __init mount_hide_init(void)
 {
     int ret1, ret2, ret3;
-    int success = 0;
+    int success;
+
+    success = 0;
 
     ret1 = register_hook("show_vfsmnt", &kp_show_vfsmnt);
     if (ret1 == 0) success++;
