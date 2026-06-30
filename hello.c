@@ -26,55 +26,51 @@ static struct kprobe kp_show_vfsmnt;
 static struct kprobe kp_show_mountinfo;
 static struct kprobe kp_m_show;
 
-static int (*orig_seq_printf)(struct seq_file *m, const char *fmt, ...);
-static int (*orig_seq_puts)(struct seq_file *m, const char *s);
-
-/* ========== 2. 统计 ========== */
 static int hijack_count = 0;
 
-/* ========== 3. 被劫持的 seq_printf（完全空输出） ========== */
-static int hijacked_seq_printf(struct seq_file *m, const char *fmt, ...)
-{
-    /* 完全忽略，不输出任何内容 */
-    return 0;
-}
-
-/* ========== 4. 被劫持的 seq_puts（完全空输出） ========== */
-static int hijacked_seq_puts(struct seq_file *m, const char *s)
-{
-    /* 完全忽略，不输出任何内容 */
-    return 0;
-}
-
-/* ========== 5. 被劫持的 show_vfsmnt ========== */
-static int hijacked_show_vfsmnt(struct seq_file *m, struct mount *mnt)
+/* ========== 2. 被劫持的 show_vfsmnt（修正参数类型） ========== */
+static int hijacked_show_vfsmnt(struct seq_file *m, void *v)
 {
     /* 完全不输出挂载点 */
     return 0;
 }
 
-/* ========== 6. 被劫持的 show_mountinfo ========== */
-static int hijacked_show_mountinfo(struct seq_file *m, struct mount *mnt)
+/* ========== 3. 被劫持的 show_mountinfo（修正参数类型） ========== */
+static int hijacked_show_mountinfo(struct seq_file *m, void *v)
 {
     /* 完全不输出挂载点信息 */
     return 0;
 }
 
-/* ========== 7. 被劫持的 m_show ========== */
+/* ========== 4. 被劫持的 m_show（修正参数类型） ========== */
 static int hijacked_m_show(struct seq_file *m, void *v)
 {
     /* 完全不输出 */
     return 0;
 }
 
-/* ========== 8. kprobe 前处理函数（返回非0跳过原函数） ========== */
+/* ========== 5. 被劫持的 seq_printf（完全空输出） ========== */
+static int hijacked_seq_printf(struct seq_file *m, const char *fmt, ...)
+{
+    /* 完全忽略，不输出任何内容 */
+    return 0;
+}
+
+/* ========== 6. 被劫持的 seq_puts（完全空输出） ========== */
+static int hijacked_seq_puts(struct seq_file *m, const char *s)
+{
+    /* 完全忽略，不输出任何内容 */
+    return 0;
+}
+
+/* ========== 7. kprobe 前处理函数（返回非0跳过原函数） ========== */
 static int handler_skip(struct kprobe *p, struct pt_regs *regs)
 {
     /* 返回 1 跳过原函数执行，实现完全空输出 */
     return 1;
 }
 
-/* ========== 9. 注册 kprobe 辅助 ========== */
+/* ========== 8. 注册 kprobe 辅助 ========== */
 static int register_kprobe_hook(const char *symbol_name, struct kprobe *kp)
 {
     unsigned long addr = 0;
@@ -112,11 +108,9 @@ static int register_kprobe_hook(const char *symbol_name, struct kprobe *kp)
     #endif
 }
 
-/* ========== 10. 直接清空 seq_file 缓冲区 ========== */
+/* ========== 9. 清空 seq_file 缓冲区（移除未使用变量警告） ========== */
 static void clear_seq_buffer(void)
 {
-    struct file *file = NULL;
-    struct seq_file *seq = NULL;
     unsigned long addr = 0;
     
     printk(KERN_INFO "mount_hide: Attempting direct seq_file clearing\n");
@@ -130,7 +124,7 @@ static void clear_seq_buffer(void)
     #endif
 }
 
-/* ========== 11. 修改 /proc/mounts 的 show 函数指针（最暴力） ========== */
+/* ========== 10. 修改 /proc/mounts 的 show 函数指针（最暴力） ========== */
 static void hijack_proc_operations(void)
 {
     struct seq_operations *ops = NULL;
@@ -144,8 +138,6 @@ static void hijack_proc_operations(void)
     if (addr) {
         ops = (struct seq_operations *)addr;
         if (ops) {
-            /* 备份原始 show 函数指针并替换为空函数 */
-            /* 注意：这里直接修改内核只读数据，需要关写保护 */
             printk(KERN_INFO "mount_hide: vfsmnt_ops at 0x%lx\n", addr);
             printk(KERN_INFO "mount_hide: Original show at 0x%p\n", ops->show);
             
@@ -193,7 +185,7 @@ static void hijack_proc_operations(void)
     #endif
 }
 
-/* ========== 12. 隐藏所有挂载点的最终方案 ========== */
+/* ========== 11. 隐藏所有挂载点的最终方案 ========== */
 static void hide_all_mounts(void)
 {
     printk(KERN_INFO "mount_hide: ===== HIDING ALL MOUNTS =====\n");
@@ -227,7 +219,7 @@ static void hide_all_mounts(void)
     printk(KERN_INFO "mount_hide: /proc/mounts should now be COMPLETELY EMPTY\n");
 }
 
-/* ========== 13. 初始化 ========== */
+/* ========== 12. 初始化 ========== */
 static int __init mount_hide_init(void)
 {
     printk(KERN_INFO "============================================\n");
@@ -243,7 +235,7 @@ static int __init mount_hide_init(void)
     return 0;
 }
 
-/* ========== 14. 退出 ========== */
+/* ========== 13. 退出 ========== */
 static void __exit mount_hide_exit(void)
 {
     printk(KERN_INFO "mount_hide: Unloading module\n");
@@ -272,6 +264,6 @@ static void __exit mount_hide_exit(void)
     printk(KERN_INFO "mount_hide: Module unloaded\n");
 }
 
-/* ========== 15. 模块入口/出口 ========== */
+/* ========== 14. 模块入口/出口 ========== */
 module_init(mount_hide_init);
 module_exit(mount_hide_exit);
