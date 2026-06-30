@@ -16,7 +16,7 @@ MODULE_DESCRIPTION("Hide mount points containing '图标'");
 static struct kprobe kp_show_vfsmnt;
 static struct kprobe kp_show_mountinfo;
 
-/* ========== 2. 保存每个show函数调用前的缓冲区长度 ========== */
+/* ========== 2. 分别保存两个文件的缓冲区长度 ========== */
 static unsigned long pre_count_vfsmnt;
 static unsigned long pre_count_mountinfo;
 
@@ -24,7 +24,9 @@ static unsigned long pre_count_mountinfo;
 static int mount_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
-    unsigned long *pre_ptr;
+    unsigned long *pre_ptr = NULL;
+    int is_mounts = 0;
+    int is_mountinfo = 0;
 
 #if defined(CONFIG_X86_64)
     m = (struct seq_file *)regs->di;
@@ -37,21 +39,27 @@ static int mount_pre_handler(struct kprobe *p, struct pt_regs *regs)
     if (!m)
         return 0;
 
-    /* 只处理 /proc/mounts 和 /proc/self/mountinfo */
+    /* 通过文件dentry名称判断是哪个proc文件 */
     if (m->file && m->file->f_path.dentry) {
         const char *name = m->file->f_path.dentry->d_name.name;
-        if (strcmp(name, "mounts") != 0 && strcmp(name, "mountinfo") != 0) {
-            return 0;
-        }
-    } else {
-        return 0;
+        if (strcmp(name, "mounts") == 0)
+            is_mounts = 1;
+        else if (strcmp(name, "mountinfo") == 0)
+            is_mountinfo = 1;
     }
 
-    /* 保存当前缓冲区的有效数据长度 */
-    pre_ptr = (unsigned long *)p->data;
-    if (pre_ptr) {
+    if (!is_mounts && !is_mountinfo)
+        return 0;
+
+    /* 选择对应的计数变量 */
+    if (is_mounts)
+        pre_ptr = &pre_count_vfsmnt;
+    else if (is_mountinfo)
+        pre_ptr = &pre_count_mountinfo;
+
+    if (pre_ptr)
         *pre_ptr = m->count;
-    }
+
     return 0;
 }
 
@@ -60,7 +68,9 @@ static void mount_post_handler(struct kprobe *p, struct pt_regs *regs,
                                unsigned long flags)
 {
     struct seq_file *m;
-    unsigned long pre_count;
+    unsigned long pre_count = 0;
+    int is_mounts = 0;
+    int is_mountinfo = 0;
 
 #if defined(CONFIG_X86_64)
     m = (struct seq_file *)regs->di;
@@ -73,7 +83,24 @@ static void mount_post_handler(struct kprobe *p, struct pt_regs *regs,
     if (!m)
         return;
 
-    pre_count = *(unsigned long *)p->data;
+    /* 判断文件类型 */
+    if (m->file && m->file->f_path.dentry) {
+        const char *name = m->file->f_path.dentry->d_name.name;
+        if (strcmp(name, "mounts") == 0)
+            is_mounts = 1;
+        else if (strcmp(name, "mountinfo") == 0)
+            is_mountinfo = 1;
+    }
+
+    if (!is_mounts && !is_mountinfo)
+        return;
+
+    /* 获取对应的pre_count */
+    if (is_mounts)
+        pre_count = pre_count_vfsmnt;
+    else if (is_mountinfo)
+        pre_count = pre_count_mountinfo;
+
     if (m->count <= pre_count)
         return;
 
@@ -83,9 +110,8 @@ static void mount_post_handler(struct kprobe *p, struct pt_regs *regs,
     }
 }
 
-/* ========== 5. 注册kprobe的辅助函数 ========== */
-static int register_hook(const char *symbol, struct kprobe *kp,
-                         unsigned long *data_ptr)
+/* ========== 5. 注册kprobe的辅助函数（不再使用data字段） ========== */
+static int register_hook(const char *symbol, struct kprobe *kp)
 {
     int ret;
 
@@ -93,7 +119,7 @@ static int register_hook(const char *symbol, struct kprobe *kp,
     kp->symbol_name = symbol;          /* 内核自动解析，无需kallsyms_lookup_name */
     kp->pre_handler = mount_pre_handler;
     kp->post_handler = mount_post_handler;
-    kp->data = (void *)data_ptr;       /* 传入计数变量的地址 */
+    /* 注意：不再设置 kp->data，因为内核6.1已无此字段 */
 
     ret = register_kprobe(kp);
     if (ret == 0) {
@@ -113,12 +139,11 @@ static int __init mount_hide_init(void)
     pre_count_vfsmnt = 0;
     pre_count_mountinfo = 0;
 
-    ret = register_hook("show_vfsmnt", &kp_show_vfsmnt, &pre_count_vfsmnt);
+    ret = register_hook("show_vfsmnt", &kp_show_vfsmnt);
     if (ret)
         goto out;
 
-    ret = register_hook("show_mountinfo", &kp_show_mountinfo,
-                        &pre_count_mountinfo);
+    ret = register_hook("show_mountinfo", &kp_show_mountinfo);
     if (ret)
         goto unreg_vfsmnt;
 
