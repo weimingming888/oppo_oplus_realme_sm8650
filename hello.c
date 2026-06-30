@@ -56,7 +56,6 @@ static void filter_seq_lines(struct seq_file *m)
                 memmove(dst + dst_pos, line_start, line_len);
             dst_pos += line_len;
         }
-        /* 否则跳过该行 */
         src_pos += line_len;
     }
     m->count = dst_pos;
@@ -64,35 +63,30 @@ static void filter_seq_lines(struct seq_file *m)
         m->buf[m->count] = '\0';
 }
 
-/* ---------- 判断文件路径是否匹配目标 ---------- */
+/* ---------- 判断文件路径是否为 /proc/mounts 或 /proc/self/mountinfo ---------- */
 static int is_target_file(struct file *file)
 {
-    char *path = NULL;
-    char *dentry_path;
-    int ret = 0;
+    char *path_buf;
+    char *path_str;
     struct path p;
+    int is_target;
 
     if (!file)
         return 0;
 
     p = file->f_path;
-    /* 分配临时路径缓冲区 */
-    dentry_path = (char *)__get_free_page(GFP_KERNEL);
-    if (!dentry_path)
+    path_buf = (char *)__get_free_page(GFP_KERNEL);
+    if (!path_buf)
         return 0;
 
-    path = dentry_path;
-    ret = dentry_path_raw(p.dentry, path, PAGE_SIZE);
-    if (ret > 0) {
-        if (strstr(path, "mounts") || strstr(path, "mountinfo"))
-            ret = 1;
-        else
-            ret = 0;
-    } else {
-        ret = 0;
+    path_str = dentry_path_raw(p.dentry, path_buf, PAGE_SIZE);
+    is_target = 0;
+    if (!IS_ERR(path_str)) {
+        if (strstr(path_str, "mounts") || strstr(path_str, "mountinfo"))
+            is_target = 1;
     }
-    free_page((unsigned long)dentry_path);
-    return ret;
+    free_page((unsigned long)path_buf);
+    return is_target;
 }
 
 /* ---------- seq_read 的 post_handler ---------- */
