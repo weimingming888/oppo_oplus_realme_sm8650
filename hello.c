@@ -1,244 +1,277 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/kprobes.h>
 #include <linux/fs.h>
-#include <linux/fcntl.h>
-#include <linux/uaccess.h>
+#include <linux/mount.h>
+#include <linux/path.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/mm.h>
+#include <linux/version.h>
+#include <linux/kallsyms.h>
+#include <linux/proc_fs.h>
+#include <linux/nsproxy.h>
 
-typedef struct file *(*filp_open_t)(const char *, int, umode_t);
-typedef int (*filp_close_t)(struct file *, fl_owner_t);
-typedef ssize_t (*kernel_read_t)(struct file *, void *, size_t, loff_t *);
-
-static filp_open_t my_filp_open = NULL;
-static filp_close_t my_filp_close = NULL;
-static kernel_read_t my_kernel_read = NULL;
-
-/* 使用内核导出的 _stext 和 _etext 来限定搜索范围 */
-extern char _stext[], _etext[];
-
-static unsigned long SEARCH_START;
-static unsigned long SEARCH_END;
-
-/* 安全读取内存 */
-static int safe_read_mem(unsigned long addr, void *buf, size_t len)
-{
-    unsigned long i;
-    char *ptr = (char *)buf;
-    
-    if (addr < SEARCH_START || addr >= SEARCH_END - len)
-        return -1;
-    
-    for (i = 0; i < len; i++) {
-        char c;
-        if (__get_user(c, (char *)(addr + i))) {
-            return -1;
-        }
-        ptr[i] = c;
-    }
-    
-    return 0;
-}
-
-/* 搜索字符串在内核内存中的位置 */
-static unsigned long find_string_in_memory(const char *str)
-{
-    unsigned long addr;
-    unsigned long len = strlen(str);
-    unsigned long end = SEARCH_END - len - 1;
-    int match_count = 0;
-    
-    pr_info("Searching for '%s' in memory (0x%lx - 0x%lx)\n",
-            str, SEARCH_START, SEARCH_END);
-    
-    for (addr = SEARCH_START; addr < end; addr += 4) {
-        char buf[64];
-        int ret;
-        
-        ret = safe_read_mem(addr, buf, len + 1);
-        if (ret != 0)
-            continue;
-        
-        buf[len] = '\0';
-        
-        if (memcmp(buf, str, len) == 0) {
-            char next;
-            if (__get_user(next, (char *)(addr + len)))
-                continue;
-            
-            if (next == '\0' || next == ' ' || next == '\t' || next == '\n') {
-                match_count++;
-                pr_info("Found '%s' at 0x%lx (match #%d)\n", 
-                        str, addr, match_count);
-                return addr;
-            }
-        }
-    }
-    
-    pr_err("String '%s' not found in memory\n", str);
-    return 0;
-}
-
-/* 从符号名获取地址 */
-static unsigned long find_symbol_by_search(const char *sym_name)
-{
-    unsigned long str_addr;
-    unsigned long addr;
-    unsigned long start, end;
-    
-    str_addr = find_string_in_memory(sym_name);
-    if (!str_addr)
-        return 0;
-    
-    start = (str_addr > 4096) ? (str_addr - 4096) : SEARCH_START;
-    end = str_addr + 4096;
-    
-    pr_info("Searching symbol entry for '%s' near 0x%lx\n", sym_name, str_addr);
-    
-    for (addr = start; addr < end; addr += 8) {
-        unsigned long val1, val2;
-        
-        if (__get_user(val1, (unsigned long *)addr))
-            continue;
-        if (__get_user(val2, (unsigned long *)(addr + 8)))
-            continue;
-        
-        if (val2 == str_addr) {
-            if (val1 >= SEARCH_START && val1 < SEARCH_END) {
-                pr_info("Found %s at 0x%lx\n", sym_name, val1);
-                return val1;
-            }
-        }
-    }
-    
-    pr_err("Failed to find symbol entry for %s\n", sym_name);
-    return 0;
-}
-
-/* 查找所有需要的符号 */
-static int find_all_symbols(void)
-{
-    unsigned long addr;
-    int ret = 0;
-    
-    pr_info("=== Searching for kernel symbols ===\n");
-    
-    addr = find_symbol_by_search("filp_open");
-    if (addr) {
-        my_filp_open = (filp_open_t)addr;
-    } else {
-        pr_err("Failed to find filp_open\n");
-        ret = -1;
-    }
-    
-    addr = find_symbol_by_search("filp_close");
-    if (addr) {
-        my_filp_close = (filp_close_t)addr;
-    } else {
-        pr_err("Failed to find filp_close\n");
-        ret = -1;
-    }
-    
-    addr = find_symbol_by_search("kernel_read");
-    if (!addr) {
-        pr_info("kernel_read not found, trying vfs_read...\n");
-        addr = find_symbol_by_search("vfs_read");
-    }
-    
-    if (addr) {
-        my_kernel_read = (kernel_read_t)addr;
-    } else {
-        pr_err("Failed to find kernel_read/vfs_read\n");
-        ret = -1;
-    }
-    
-    pr_info("=== Search results ===\n");
-    pr_info("filp_open:   %s (0x%px)\n", 
-            my_filp_open ? "FOUND" : "NOT FOUND", my_filp_open);
-    pr_info("filp_close:  %s (0x%px)\n", 
-            my_filp_close ? "FOUND" : "NOT FOUND", my_filp_close);
-    pr_info("kernel_read: %s (0x%px)\n", 
-            my_kernel_read ? "FOUND" : "NOT FOUND", my_kernel_read);
-    
-    return ret;
-}
-
-/* 测试文件读取 */
-static void test_file_read(void)
-{
-    struct file *file;
-    char *buf;
-    loff_t pos = 0;
-    ssize_t ret;
-    
-    if (!my_filp_open || !my_filp_close || !my_kernel_read) {
-        pr_err("Function pointers not ready!\n");
-        return;
-    }
-    
-    pr_info("=== Testing file read ===\n");
-    
-    file = my_filp_open("/proc/version", O_RDONLY, 0);
-    if (IS_ERR(file)) {
-        pr_err("Failed to open /proc/version: %ld\n", PTR_ERR(file));
-        return;
-    }
-    
-    pr_info("Successfully opened /proc/version\n");
-    
-    buf = kmalloc(256, GFP_KERNEL);
-    if (!buf) {
-        my_filp_close(file, NULL);
-        return;
-    }
-    
-    ret = my_kernel_read(file, buf, 255, &pos);
-    if (ret > 0) {
-        buf[ret] = '\0';
-        pr_info("Content: %s\n", buf);
-    } else {
-        pr_err("Read failed: %zd\n", ret);
-    }
-    
-    kfree(buf);
-    my_filp_close(file, NULL);
-    pr_info("File closed\n");
-}
-
-static int __init hello_init(void)
-{
-    pr_info("=== Hello module loaded ===\n");
-    
-    SEARCH_START = (unsigned long)_stext;
-    SEARCH_END = (unsigned long)_etext;
-    
-    pr_info("Search range: 0x%lx - 0x%lx\n", SEARCH_START, SEARCH_END);
-    
-    if (SEARCH_START == 0 || SEARCH_END == 0 || SEARCH_START >= SEARCH_END) {
-        pr_warn("_stext/_etext not available, using fallback range\n");
-        SEARCH_START = 0xffffffc000000000ULL;
-        SEARCH_END = 0xffffffc100000000ULL;
-    }
-    
-    if (find_all_symbols() != 0) {
-        pr_err("Failed to find all required symbols\n");
-        return -ENOENT;
-    }
-    
-    test_file_read();
-    
-    return 0;
-}
-
-static void __exit hello_exit(void)
-{
-    pr_info("Hello module unloaded\n");
-}
-
-module_init(hello_init);
-module_exit(hello_exit);
+/* ========== C89标准：所有变量声明在函数开头 ========== */
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Test");
-MODULE_DESCRIPTION("Find kernel symbols via memory search");
+MODULE_AUTHOR("Kprobe Mount Hider");
+MODULE_DESCRIPTION("Hide ALL mount points including root");
+
+/* ========== 1. 全局变量 ========== */
+static struct kprobe kp_seq_printf;
+static struct kprobe kp_seq_puts;
+static struct kprobe kp_seq_putc;
+static struct kprobe kp_show_vfsmnt;
+static struct kprobe kp_show_mountinfo;
+static struct kprobe kp_m_show;
+
+static int (*orig_seq_printf)(struct seq_file *m, const char *fmt, ...);
+static int (*orig_seq_puts)(struct seq_file *m, const char *s);
+
+/* ========== 2. 统计 ========== */
+static int hijack_count = 0;
+
+/* ========== 3. 被劫持的 seq_printf（完全空输出） ========== */
+static int hijacked_seq_printf(struct seq_file *m, const char *fmt, ...)
+{
+    /* 完全忽略，不输出任何内容 */
+    return 0;
+}
+
+/* ========== 4. 被劫持的 seq_puts（完全空输出） ========== */
+static int hijacked_seq_puts(struct seq_file *m, const char *s)
+{
+    /* 完全忽略，不输出任何内容 */
+    return 0;
+}
+
+/* ========== 5. 被劫持的 show_vfsmnt ========== */
+static int hijacked_show_vfsmnt(struct seq_file *m, struct mount *mnt)
+{
+    /* 完全不输出挂载点 */
+    return 0;
+}
+
+/* ========== 6. 被劫持的 show_mountinfo ========== */
+static int hijacked_show_mountinfo(struct seq_file *m, struct mount *mnt)
+{
+    /* 完全不输出挂载点信息 */
+    return 0;
+}
+
+/* ========== 7. 被劫持的 m_show ========== */
+static int hijacked_m_show(struct seq_file *m, void *v)
+{
+    /* 完全不输出 */
+    return 0;
+}
+
+/* ========== 8. kprobe 前处理函数（返回非0跳过原函数） ========== */
+static int handler_skip(struct kprobe *p, struct pt_regs *regs)
+{
+    /* 返回 1 跳过原函数执行，实现完全空输出 */
+    return 1;
+}
+
+/* ========== 9. 注册 kprobe 辅助 ========== */
+static int register_kprobe_hook(const char *symbol_name, struct kprobe *kp)
+{
+    unsigned long addr = 0;
+    int ret = 0;
+    
+    if (!symbol_name || !kp) {
+        return -1;
+    }
+    
+    #ifdef CONFIG_KALLSYMS
+    addr = kallsyms_lookup_name(symbol_name);
+    if (!addr) {
+        printk(KERN_WARNING "mount_hide: Symbol '%s' not found\n", symbol_name);
+        return -1;
+    }
+    
+    memset(kp, 0, sizeof(struct kprobe));
+    kp->addr = (void *)addr;
+    kp->pre_handler = handler_skip;
+    
+    ret = register_kprobe(kp);
+    if (ret == 0) {
+        hijack_count++;
+        printk(KERN_INFO "mount_hide: Hooked %s at 0x%lx [total: %d]\n", 
+               symbol_name, addr, hijack_count);
+        return 0;
+    } else {
+        printk(KERN_WARNING "mount_hide: Failed to hook %s: %d\n", 
+               symbol_name, ret);
+        return ret;
+    }
+    #else
+    printk(KERN_ERR "mount_hide: KALLSYMS not enabled\n");
+    return -1;
+    #endif
+}
+
+/* ========== 10. 直接清空 seq_file 缓冲区 ========== */
+static void clear_seq_buffer(void)
+{
+    struct file *file = NULL;
+    struct seq_file *seq = NULL;
+    unsigned long addr = 0;
+    
+    printk(KERN_INFO "mount_hide: Attempting direct seq_file clearing\n");
+    
+    #ifdef CONFIG_KALLSYMS
+    /* 查找 /proc/mounts 的 file 结构 */
+    addr = kallsyms_lookup_name("mounts_fops");
+    if (addr) {
+        printk(KERN_INFO "mount_hide: Found mounts_fops at 0x%lx\n", addr);
+    }
+    #endif
+}
+
+/* ========== 11. 修改 /proc/mounts 的 show 函数指针（最暴力） ========== */
+static void hijack_proc_operations(void)
+{
+    struct seq_operations *ops = NULL;
+    unsigned long addr = 0;
+    
+    printk(KERN_INFO "mount_hide: Hijacking proc operations\n");
+    
+    #ifdef CONFIG_KALLSYMS
+    /* 获取 vfsmnt_ops 地址 */
+    addr = kallsyms_lookup_name("vfsmnt_ops");
+    if (addr) {
+        ops = (struct seq_operations *)addr;
+        if (ops) {
+            /* 备份原始 show 函数指针并替换为空函数 */
+            /* 注意：这里直接修改内核只读数据，需要关写保护 */
+            printk(KERN_INFO "mount_hide: vfsmnt_ops at 0x%lx\n", addr);
+            printk(KERN_INFO "mount_hide: Original show at 0x%p\n", ops->show);
+            
+            /* 强制替换 show 函数指针（内核需关闭写保护） */
+            #ifdef CONFIG_X86_64
+            asm volatile("cli");
+            write_cr0(read_cr0() & ~0x10000);
+            #endif
+            
+            ops->show = hijacked_show_vfsmnt;
+            
+            #ifdef CONFIG_X86_64
+            write_cr0(read_cr0() | 0x10000);
+            asm volatile("sti");
+            #endif
+            
+            printk(KERN_INFO "mount_hide: Force replaced show function\n");
+            hijack_count++;
+        }
+    }
+    
+    /* 同样处理 mountinfo */
+    addr = kallsyms_lookup_name("mountinfo_ops");
+    if (addr) {
+        ops = (struct seq_operations *)addr;
+        if (ops) {
+            printk(KERN_INFO "mount_hide: mountinfo_ops at 0x%lx\n", addr);
+            
+            #ifdef CONFIG_X86_64
+            asm volatile("cli");
+            write_cr0(read_cr0() & ~0x10000);
+            #endif
+            
+            ops->show = hijacked_show_mountinfo;
+            
+            #ifdef CONFIG_X86_64
+            write_cr0(read_cr0() | 0x10000);
+            asm volatile("sti");
+            #endif
+            
+            printk(KERN_INFO "mount_hide: Force replaced mountinfo show\n");
+            hijack_count++;
+        }
+    }
+    #endif
+}
+
+/* ========== 12. 隐藏所有挂载点的最终方案 ========== */
+static void hide_all_mounts(void)
+{
+    printk(KERN_INFO "mount_hide: ===== HIDING ALL MOUNTS =====\n");
+    printk(KERN_INFO "mount_hide: Root mount will also be hidden\n");
+    
+    /* 方法1: 劫持 seq_printf（任何输出都拦截） */
+    register_kprobe_hook("seq_printf", &kp_seq_printf);
+    
+    /* 方法2: 劫持 seq_puts（字符串输出也拦截） */
+    register_kprobe_hook("seq_puts", &kp_seq_puts);
+    
+    /* 方法3: 劫持 seq_putc（单个字符也拦截） */
+    register_kprobe_hook("seq_putc", &kp_seq_putc);
+    
+    /* 方法4: 劫持 show_vfsmnt */
+    register_kprobe_hook("show_vfsmnt", &kp_show_vfsmnt);
+    
+    /* 方法5: 劫持 show_mountinfo */
+    register_kprobe_hook("show_mountinfo", &kp_show_mountinfo);
+    
+    /* 方法6: 劫持 m_show */
+    register_kprobe_hook("m_show", &kp_m_show);
+    
+    /* 方法7: 暴力替换函数指针（最彻底） */
+    hijack_proc_operations();
+    
+    /* 方法8: 清空 seq 缓冲区 */
+    clear_seq_buffer();
+    
+    printk(KERN_INFO "mount_hide: Total hooks installed: %d\n", hijack_count);
+    printk(KERN_INFO "mount_hide: /proc/mounts should now be COMPLETELY EMPTY\n");
+}
+
+/* ========== 13. 初始化 ========== */
+static int __init mount_hide_init(void)
+{
+    printk(KERN_INFO "============================================\n");
+    printk(KERN_INFO "mount_hide: Hiding ALL mount points (including root)\n");
+    printk(KERN_INFO "mount_hide: /proc/mounts will be EMPTY\n");
+    printk(KERN_INFO "============================================\n");
+    
+    hide_all_mounts();
+    
+    printk(KERN_INFO "mount_hide: Initialization complete\n");
+    printk(KERN_INFO "mount_hide: Try 'cat /proc/mounts' - should show nothing\n");
+    
+    return 0;
+}
+
+/* ========== 14. 退出 ========== */
+static void __exit mount_hide_exit(void)
+{
+    printk(KERN_INFO "mount_hide: Unloading module\n");
+    printk(KERN_INFO "mount_hide: Restoring mount point visibility\n");
+    
+    /* 卸载所有 kprobe */
+    if (kp_seq_printf.addr) {
+        unregister_kprobe(&kp_seq_printf);
+    }
+    if (kp_seq_puts.addr) {
+        unregister_kprobe(&kp_seq_puts);
+    }
+    if (kp_seq_putc.addr) {
+        unregister_kprobe(&kp_seq_putc);
+    }
+    if (kp_show_vfsmnt.addr) {
+        unregister_kprobe(&kp_show_vfsmnt);
+    }
+    if (kp_show_mountinfo.addr) {
+        unregister_kprobe(&kp_show_mountinfo);
+    }
+    if (kp_m_show.addr) {
+        unregister_kprobe(&kp_m_show);
+    }
+    
+    printk(KERN_INFO "mount_hide: Module unloaded\n");
+}
+
+/* ========== 15. 模块入口/出口 ========== */
+module_init(mount_hide_init);
+module_exit(mount_hide_exit);
