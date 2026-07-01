@@ -8,6 +8,7 @@
 MODULE_LICENSE("GPL");
 
 static struct kprobe kp;
+static unsigned long last_vma_start = 0;
 
 static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
@@ -15,6 +16,7 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
     char *line_start, *line_end;
     char *p_anon;
     char line[512];
+    unsigned long vma_start;
     int len;
     
     (void)p;
@@ -43,20 +45,32 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
     memcpy(line, m->buf, len);
     line[len] = '\0';
     
-    /* 检查是否为匿名映射（地址范围后面没有文件路径） */
-    p_anon = strstr(line, "00:00 0");
+    /* 提取起始地址 */
+    if (sscanf(line, "%lx", &vma_start) != 1)
+        return;
     
-    if (p_anon) {
-        /* 检查权限：r-xp 或 rwxp */
-        if (strstr(line, "r-xp") || strstr(line, "rwxp")) {
-            printk(KERN_INFO "[MAPS] %s\n", line);
-        }
+    /* 如果地址相同，说明是重复调用，跳过 */
+    if (vma_start == last_vma_start)
+        return;
+    
+    last_vma_start = vma_start;
+    
+    /* 检查是否为匿名映射 */
+    p_anon = strstr(line, "00:00 0");
+    if (!p_anon)
+        return;
+    
+    /* 检查权限：r-xp 或 rwxp */
+    if (strstr(line, "r-xp") || strstr(line, "rwxp")) {
+        printk(KERN_INFO "[MAPS] %s\n", line);
     }
 }
 
 static int __init init(void)
 {
     int ret;
+    
+    last_vma_start = 0;
     
     kp.symbol_name = "show_map_vma";
     kp.post_handler = handler_post;
@@ -76,7 +90,7 @@ static int __init init(void)
     }
     
     printk(KERN_INFO "[MAPS] Loaded, hook at %p\n", kp.addr);
-    printk(KERN_INFO "[MAPS] Filter: anonymous r-xp and rwxp only\n");
+    printk(KERN_INFO "[MAPS] Filter: anonymous r-xp and rwxp only (dedup)\n");
     return 0;
 }
 
