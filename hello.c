@@ -11,16 +11,20 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DuckDetector Bypass");
-MODULE_DESCRIPTION("Hide LSPosed traces from com.eltavine.duckdetector with debug");
+MODULE_DESCRIPTION("Hide LSPosed traces with full symbol validation");
 
 /* ---------- 全局变量 ---------- */
 static struct kprobe kp_seq_read;
 static struct kprobe kp_proc_reg_read;
-static unsigned long target_pid = 0;
 static int hidden_count = 0;
 static int total_lines = 0;
 
-/* ---------- 通过 kprobe 获取符号地址 ---------- */
+/* 记录获取到的符号地址 */
+static unsigned long g_seq_read_addr = 0;
+static unsigned long g_proc_reg_read_addr = 0;
+static unsigned long g_find_task_by_vpid_addr = 0;
+
+/* ---------- 通过 kprobe 获取符号地址（带校验） ---------- */
 static unsigned long get_symbol_addr(const char *name)
 {
     struct kprobe kp;
@@ -36,16 +40,58 @@ static unsigned long get_symbol_addr(const char *name)
     if (ret == 0) {
         addr = (unsigned long)kp.addr;
         unregister_kprobe(&kp);
+        printk(KERN_INFO "[Validator] ✅ %s = 0x%lx\n", name, addr);
+    } else {
+        printk(KERN_WARNING "[Validator] ❌ %s NOT FOUND (err=%d)\n", name, ret);
     }
     
     return addr;
+}
+
+/* ---------- 校验所有需要的符号 ---------- */
+static int validate_all_symbols(void)
+{
+    int success = 0;
+    
+    printk(KERN_INFO "[Validator] ========================================\n");
+    printk(KERN_INFO "[Validator] Validating required symbols...\n");
+    printk(KERN_INFO "[Validator] ========================================\n");
+    
+    /* 1. 获取 seq_read */
+    g_seq_read_addr = get_symbol_addr("seq_read");
+    if (g_seq_read_addr) {
+        success++;
+    }
+    
+    /* 2. 获取 proc_reg_read（备选） */
+    g_proc_reg_read_addr = get_symbol_addr("proc_reg_read");
+    if (g_proc_reg_read_addr) {
+        success++;
+    }
+    
+    /* 3. 获取 find_task_by_vpid（调试用） */
+    g_find_task_by_vpid_addr = get_symbol_addr("find_task_by_vpid");
+    if (g_find_task_by_vpid_addr) {
+        success++;
+    }
+    
+    printk(KERN_INFO "[Validator] ========================================\n");
+    printk(KERN_INFO "[Validator] Symbols found: %d/3\n", success);
+    printk(KERN_INFO "[Validator] ========================================\n");
+    
+    /* 至少要有一个可用 */
+    if (g_seq_read_addr == 0 && g_proc_reg_read_addr == 0) {
+        printk(KERN_ERR "[Validator] ❌ FATAL: No read function available!\n");
+        return -ENOENT;
+    }
+    
+    return 0;
 }
 
 /* ---------- 检查当前进程是否是 DuckDetector ---------- */
 static int is_duckdetector(void)
 {
     struct task_struct *task = current;
-    char *cmdline;
     static pid_t cached_pid = 0;
     
     if (!task)
@@ -62,33 +108,10 @@ static int is_duckdetector(void)
         return 1;
     }
     
-    /* 检查命令行（更准确） */
-    if (task->mm && task->mm->arg_start) {
-        char buf[128];
-        unsigned long arg_start = task->mm->arg_start;
-        unsigned long arg_end = task->mm->arg_end;
-        unsigned long len = arg_end - arg_start;
-        
-        if (len > 0 && len < 127) {
-            if (strncpy_from_user(buf, (void *)arg_start, len) > 0) {
-                buf[len] = '\0';
-                if (strstr(buf, "duckdetector") ||
-                    strstr(buf, "eltavine")) {
-                    if (cached_pid != task->pid) {
-                        cached_pid = task->pid;
-                        printk(KERN_INFO "[DuckDetector] ✅ Found target via cmdline! PID=%d\n", 
-                               task->pid);
-                    }
-                    return 1;
-                }
-            }
-        }
-    }
-    
     return 0;
 }
 
-/* ---------- 获取隐藏原因的描述 ---------- */
+/* ---------- 获取隐藏原因 ---------- */
 static const char *get_hide_reason(const char *line, unsigned long len)
 {
     char lower[256];
@@ -103,44 +126,29 @@ static const char *get_hide_reason(const char *line, unsigned long len)
     }
     lower[i < 255 ? i : 255] = '\0';
     
-    if (strstr(lower, "anonymous") && strstr(lower, "x")) {
+    if (strstr(lower, "anonymous") && strstr(lower, "x"))
         return "anonymous executable (LSPosed code)";
-    }
     
-    if (strstr(lower, "rwx")) {
+    if (strstr(lower, "rwx"))
         return "RWX permission (dangerous)";
-    }
     
     if (strstr(lower, "libart.so") && 
-        (strstr(lower, "shared-dirty") || strstr(lower, "private-dirty"))) {
+        (strstr(lower, "shared-dirty") || strstr(lower, "private-dirty")))
         return "libart.so dirty pages (hooked)";
-    }
     
-    if (strstr(lower, "lsposed") ||
-        strstr(lower, "lspatch") ||
-        strstr(lower, "riru") ||
-        strstr(lower, "zygisk") ||
-        strstr(lower, "xposed") ||
-        strstr(lower, "edxposed") ||
-        strstr(lower, "liblsp")) {
+    if (strstr(lower, "lsposed") || strstr(lower, "lspatch") ||
+        strstr(lower, "riru") || strstr(lower, "zygisk") ||
+        strstr(lower, "xposed") || strstr(lower, "edxposed") ||
+        strstr(lower, "liblsp"))
         return "LSPosed related file";
-    }
     
-    if (strstr(lower, "anonymous") && 
-        (strstr(lower, "---p") == NULL) &&
-        (strstr(lower, "rw-p") == NULL) &&
-        (strstr(lower, "r--p") == NULL)) {
-        return "suspicious anonymous mapping";
-    }
-    
-    return "unknown reason";
+    return "suspicious mapping";
 }
 
-/* ---------- 提取行首地址（用于日志） ---------- */
+/* ---------- 提取行预览 ---------- */
 static void extract_line_preview(const char *line, unsigned long len, char *buf, int buf_len)
 {
-    int i;
-    int copied = 0;
+    int i, copied = 0;
     
     for (i = 0; i < len && i < 80 && copied < buf_len - 1; i++) {
         if (line[i] == '\n' || line[i] == '\r')
@@ -153,11 +161,10 @@ static void extract_line_preview(const char *line, unsigned long len, char *buf,
 }
 
 /* ---------- 检查一行是否应该被隐藏 ---------- */
-static int should_hide_line(const char *line, unsigned long len, char *reason_out, int reason_len)
+static int should_hide_line(const char *line, unsigned long len)
 {
     char lower[256];
     int i;
-    const char *reason = NULL;
     
     if (!line || len == 0)
         return 0;
@@ -168,63 +175,31 @@ static int should_hide_line(const char *line, unsigned long len, char *reason_ou
     }
     lower[i < 255 ? i : 255] = '\0';
     
-    /* 1. 隐藏匿名可执行映射（LSPosed 注入代码） */
-    if (strstr(lower, "anonymous") && strstr(lower, "x")) {
-        reason = "anonymous executable (LSPosed code)";
-        goto hide;
-    }
+    if (strstr(lower, "anonymous") && strstr(lower, "x"))
+        return 1;
     
-    /* 2. 隐藏 RWX 映射 */
-    if (strstr(lower, "rwx")) {
-        reason = "RWX permission (dangerous)";
-        goto hide;
-    }
+    if (strstr(lower, "rwx"))
+        return 1;
     
-    /* 3. 隐藏 libart.so 脏页 */
     if (strstr(lower, "libart.so") && 
-        (strstr(lower, "shared-dirty") || strstr(lower, "private-dirty"))) {
-        reason = "libart.so dirty pages (hooked)";
-        goto hide;
-    }
+        (strstr(lower, "shared-dirty") || strstr(lower, "private-dirty")))
+        return 1;
     
-    /* 4. 隐藏 LSPosed 相关 */
-    if (strstr(lower, "lsposed") ||
-        strstr(lower, "lspatch") ||
-        strstr(lower, "riru") ||
-        strstr(lower, "zygisk") ||
-        strstr(lower, "xposed") ||
-        strstr(lower, "edxposed") ||
-        strstr(lower, "liblsp")) {
-        reason = "LSPosed related file";
-        goto hide;
-    }
-    
-    /* 5. 隐藏任何可执行的匿名映射 */
-    if (strstr(lower, "anonymous") && 
-        (strstr(lower, "---p") == NULL) &&
-        (strstr(lower, "rw-p") == NULL) &&
-        (strstr(lower, "r--p") == NULL)) {
-        reason = "suspicious anonymous mapping";
-        goto hide;
-    }
+    if (strstr(lower, "lsposed") || strstr(lower, "lspatch") ||
+        strstr(lower, "riru") || strstr(lower, "zygisk") ||
+        strstr(lower, "xposed") || strstr(lower, "edxposed") ||
+        strstr(lower, "liblsp"))
+        return 1;
     
     return 0;
-
-hide:
-    if (reason_out && reason_len > 0) {
-        strncpy(reason_out, reason, reason_len - 1);
-        reason_out[reason_len - 1] = '\0';
-    }
-    return 1;
 }
 
-/* ---------- 过滤 maps 内容 ---------- */
+/* ---------- 过滤 maps ---------- */
 static void filter_maps_lines(struct seq_file *m)
 {
     char *buf, *src, *dst, *line_start, *line_end;
     unsigned long count, src_pos, dst_pos, remaining, line_len;
     char line_preview[128];
-    char reason[64];
     int hidden_this_time = 0;
     
     if (!m || !m->buf || m->count == 0)
@@ -247,11 +222,11 @@ static void filter_maps_lines(struct seq_file *m)
             
             extract_line_preview(line_start, line_len, line_preview, sizeof(line_preview));
             
-            if (should_hide_line(line_start, line_len, reason, sizeof(reason))) {
+            if (should_hide_line(line_start, line_len)) {
                 hidden_this_time++;
                 hidden_count++;
                 printk(KERN_INFO "[DuckDetector] 🚫 HIDDEN: %s | Reason: %s\n", 
-                       line_preview, reason);
+                       line_preview, get_hide_reason(line_start, line_len));
             } else {
                 if (dst_pos != src_pos)
                     memmove(dst + dst_pos, line_start, line_len);
@@ -267,11 +242,11 @@ static void filter_maps_lines(struct seq_file *m)
         extract_line_preview(line_start, line_len, line_preview, sizeof(line_preview));
         total_lines++;
         
-        if (should_hide_line(line_start, line_len, reason, sizeof(reason))) {
+        if (should_hide_line(line_start, line_len)) {
             hidden_this_time++;
             hidden_count++;
             printk(KERN_INFO "[DuckDetector] 🚫 HIDDEN: %s | Reason: %s\n", 
-                   line_preview, reason);
+                   line_preview, get_hide_reason(line_start, line_len));
         } else {
             if (dst_pos != src_pos)
                 memmove(dst + dst_pos, line_start, line_len);
@@ -281,8 +256,8 @@ static void filter_maps_lines(struct seq_file *m)
     }
     
     if (hidden_this_time > 0) {
-        printk(KERN_INFO "[DuckDetector] 📊 This read: %d hidden, %d shown (total hidden: %d)\n", 
-               hidden_this_time, total_lines - hidden_this_time, hidden_count);
+        printk(KERN_INFO "[DuckDetector] 📊 This read: %d hidden (total: %d)\n", 
+               hidden_this_time, hidden_count);
     }
     
     m->count = dst_pos;
@@ -340,7 +315,6 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     if (!file || !is_maps_file(file))
         return;
     
-    /* 只保护 DuckDetector */
     if (!is_duckdetector())
         return;
     
@@ -351,8 +325,47 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     if (!m)
         return;
     
-    printk(KERN_INFO "[DuckDetector] 🔍 PID=%d reading %s, count=%ld\n", 
-           task->pid, file->f_path.dentry->d_name.name, ret);
+    printk(KERN_INFO "[DuckDetector] 🔍 PID=%d reading %s\n", 
+           task->pid, file->f_path.dentry->d_name.name);
+    
+    filter_maps_lines(m);
+}
+
+/* ---------- proc_reg_read post_handler ---------- */
+static void proc_reg_read_post_handler(struct kprobe *p, struct pt_regs *regs,
+                                       unsigned long flags)
+{
+    struct file *file;
+    struct seq_file *m;
+    ssize_t ret;
+    struct task_struct *task = current;
+    
+#if defined(CONFIG_ARM64)
+    file = (struct file *)regs->regs[0];
+    ret = (ssize_t)regs->regs[0];
+#elif defined(CONFIG_X86_64)
+    file = (struct file *)regs->di;
+    ret = (ssize_t)regs->ax;
+#else
+    file = NULL;
+    ret = 0;
+#endif
+    
+    if (!file || !is_maps_file(file))
+        return;
+    
+    if (!is_duckdetector())
+        return;
+    
+    if (ret <= 0)
+        return;
+    
+    m = (struct seq_file *)file->private_data;
+    if (!m)
+        return;
+    
+    printk(KERN_INFO "[DuckDetector] 🔍 PID=%d reading %s (via proc_reg_read)\n", 
+           task->pid, file->f_path.dentry->d_name.name);
     
     filter_maps_lines(m);
 }
@@ -360,44 +373,63 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
 /* ---------- 模块初始化 ---------- */
 static int __init duck_bypass_init(void)
 {
-    unsigned long addr;
     int ret;
+    int hooks_registered = 0;
     
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "🐤 DuckDetector Bypass (Debug Mode)\n");
+    printk(KERN_INFO "🐤 DuckDetector Bypass (Full Validation)\n");
     printk(KERN_INFO "Target: com.eltavine.duckdetector\n");
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[DuckDetector] Waiting for target app...\n");
     
-    /* 获取 seq_read 地址 */
-    addr = get_symbol_addr("seq_read");
-    if (!addr) {
-        addr = get_symbol_addr("proc_reg_read");
-        if (!addr) {
-            printk(KERN_ERR "[DuckDetector] ❌ No suitable symbol found\n");
-            return -ENOENT;
+    /* 1. 校验所有符号 */
+    ret = validate_all_symbols();
+    if (ret < 0) {
+        printk(KERN_ERR "[DuckDetector] ❌ Symbol validation failed!\n");
+        return ret;
+    }
+    
+    /* 2. 注册 seq_read hook */
+    if (g_seq_read_addr) {
+        memset(&kp_seq_read, 0, sizeof(struct kprobe));
+        kp_seq_read.addr = (void *)g_seq_read_addr;
+        kp_seq_read.post_handler = seq_read_post_handler;
+        
+        ret = register_kprobe(&kp_seq_read);
+        if (ret == 0) {
+            hooks_registered++;
+            printk(KERN_INFO "[DuckDetector] ✅ seq_read hook registered\n");
+        } else {
+            printk(KERN_WARNING "[DuckDetector] ⚠️ seq_read hook failed (err=%d)\n", ret);
         }
     }
     
-    printk(KERN_INFO "[DuckDetector] ✅ Hook target at 0x%lx\n", addr);
-    
-    /* 注册 kprobe */
-    memset(&kp_seq_read, 0, sizeof(struct kprobe));
-    kp_seq_read.addr = (void *)addr;
-    kp_seq_read.post_handler = seq_read_post_handler;
-    
-    ret = register_kprobe(&kp_seq_read);
-    if (ret == 0) {
-        printk(KERN_INFO "[DuckDetector] ✅ Hooked successfully!\n");
-        printk(KERN_INFO "========================================\n");
-        printk(KERN_INFO "🐤 DuckDetector is now blind to LSPosed\n");
-        printk(KERN_INFO "📊 Debug logs will show hidden entries\n");
-        printk(KERN_INFO "========================================\n");
-        return 0;
-    } else {
-        printk(KERN_ERR "[DuckDetector] ❌ Failed to hook: %d\n", ret);
-        return ret;
+    /* 3. 注册 proc_reg_read hook（备选） */
+    if (g_proc_reg_read_addr) {
+        memset(&kp_proc_reg_read, 0, sizeof(struct kprobe));
+        kp_proc_reg_read.addr = (void *)g_proc_reg_read_addr;
+        kp_proc_reg_read.post_handler = proc_reg_read_post_handler;
+        
+        ret = register_kprobe(&kp_proc_reg_read);
+        if (ret == 0) {
+            hooks_registered++;
+            printk(KERN_INFO "[DuckDetector] ✅ proc_reg_read hook registered\n");
+        } else {
+            printk(KERN_WARNING "[DuckDetector] ⚠️ proc_reg_read hook failed (err=%d)\n", ret);
+        }
     }
+    
+    /* 4. 检查是否有任何 hook 成功 */
+    if (hooks_registered == 0) {
+        printk(KERN_ERR "[DuckDetector] ❌ No hooks registered!\n");
+        return -ENOENT;
+    }
+    
+    printk(KERN_INFO "========================================\n");
+    printk(KERN_INFO "🐤 DuckDetector bypass ACTIVE\n");
+    printk(KERN_INFO "📊 %d hook(s) registered\n", hooks_registered);
+    printk(KERN_INFO "========================================\n");
+    
+    return 0;
 }
 
 /* ---------- 模块退出 ---------- */
@@ -405,7 +437,7 @@ static void __exit duck_bypass_exit(void)
 {
     unregister_kprobe(&kp_seq_read);
     unregister_kprobe(&kp_proc_reg_read);
-    printk(KERN_INFO "[DuckDetector] 📊 Total hidden entries: %d\n", hidden_count);
+    printk(KERN_INFO "[DuckDetector] 📊 Total hidden: %d entries\n", hidden_count);
     printk(KERN_INFO "[DuckDetector] Bypass unloaded\n");
 }
 
