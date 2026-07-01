@@ -9,7 +9,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Anonymous Exec Filter");
-MODULE_DESCRIPTION("Filter anonymous executable memory mappings globally");
+MODULE_DESCRIPTION("Filter r-xp 00000000 anonymous memory");
 
 static struct kprobe kp_seq_read;
 static unsigned long g_seq_read_addr;
@@ -32,8 +32,6 @@ static unsigned long get_symbol_addr(const char *name)
         addr = (unsigned long)kp.addr;
         unregister_kprobe(&kp);
         printk(KERN_INFO "[Filter] ✅ %s = 0x%lx\n", name, addr);
-    } else {
-        printk(KERN_WARNING "[Filter] ❌ %s NOT FOUND (err=%d)\n", name, ret);
     }
     
     return addr;
@@ -45,57 +43,17 @@ static int is_maps_file(struct file *file)
     struct dentry *dentry;
     const char *name;
     
-    if (!file) {
-        return 0;
-    }
-    
+    if (!file) return 0;
     dentry = file->f_path.dentry;
-    if (!dentry) {
-        return 0;
-    }
-    
+    if (!dentry) return 0;
     name = dentry->d_name.name;
-    if (!name) {
-        return 0;
-    }
+    if (!name) return 0;
     
     if (strcmp(name, "maps") == 0 ||
         strcmp(name, "smaps") == 0 ||
         strstr(name, "maps") == name) {
         return 1;
     }
-    
-    return 0;
-}
-
-/* ---------- 检查一行是否是匿名可执行内存 ---------- */
-static int is_anonymous_executable(const char *line, unsigned long len)
-{
-    char lower[256];
-    int i;
-    
-    if (!line || len == 0) {
-        return 0;
-    }
-    
-    for (i = 0; i < len && i < 255; i++) {
-        lower[i] = (line[i] >= 'A' && line[i] <= 'Z') ?
-                   line[i] + 0x20 : line[i];
-    }
-    lower[i < 255 ? i : 255] = '\0';
-    
-    /* 检查是否有 'x' 权限（可执行） */
-    if (!strstr(lower, "x")) {
-        return 0;
-    }
-    
-    /* 检查是否是匿名映射（没有文件路径） */
-    if (strstr(lower, "[anonymous]") ||
-        strstr(lower, "[anon:") ||
-        strstr(lower, " 00:00 0 ")) {
-        return 1;
-    }
-    
     return 0;
 }
 
@@ -106,9 +64,7 @@ static void filter_maps_lines(struct seq_file *m)
     unsigned long count, src_pos, dst_pos, remaining, line_len;
     int hidden_count;
     
-    if (!m || !m->buf || m->count == 0) {
-        return;
-    }
+    if (!m || !m->buf || m->count == 0) return;
     
     hidden_count = 0;
     buf = m->buf;
@@ -126,7 +82,8 @@ static void filter_maps_lines(struct seq_file *m)
             line_start = src + src_pos;
             line_len = remaining;
             
-            if (!is_anonymous_executable(line_start, line_len)) {
+            /* 直接匹配 "r-xp 00000000" */
+            if (strstr(line_start, "r-xp 00000000") == NULL) {
                 if (dst_pos != src_pos) {
                     memmove(dst + dst_pos, line_start, line_len);
                 }
@@ -141,7 +98,8 @@ static void filter_maps_lines(struct seq_file *m)
         line_start = src + src_pos;
         line_len = (unsigned long)(line_end - line_start) + 1;
         
-        if (!is_anonymous_executable(line_start, line_len)) {
+        /* 直接匹配 "r-xp 00000000" */
+        if (strstr(line_start, "r-xp 00000000") == NULL) {
             if (dst_pos != src_pos) {
                 memmove(dst + dst_pos, line_start, line_len);
             }
@@ -153,8 +111,7 @@ static void filter_maps_lines(struct seq_file *m)
     }
     
     if (hidden_count > 0) {
-        printk(KERN_INFO "[Filter] 🧹 Filtered %d anonymous executable lines for PID=%d\n",
-               hidden_count, current->pid);
+        printk(KERN_INFO "[Filter] 🧹 Filtered %d lines\n", hidden_count);
     }
     
     m->count = dst_pos;
@@ -185,18 +142,12 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     ret = 0;
 #endif
     
-    if (!file || ret <= 0) {
-        return;
-    }
-    
-    if (!is_maps_file(file)) {
+    if (!file || ret <= 0 || !is_maps_file(file)) {
         return;
     }
     
     m = (struct seq_file *)file->private_data;
-    if (!m) {
-        return;
-    }
+    if (!m) return;
     
     filter_maps_lines(m);
 }
@@ -207,8 +158,7 @@ static int __init filter_init(void)
     int ret;
     
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] Anonymous Executable Memory Filter\n");
-    printk(KERN_INFO "[Filter] Global - all processes\n");
+    printk(KERN_INFO "[Filter] Filter: r-xp 00000000\n");
     printk(KERN_INFO "========================================\n");
     
     g_seq_read_addr = get_symbol_addr("seq_read");
@@ -229,14 +179,13 @@ static int __init filter_init(void)
     if (ret == 0) {
         printk(KERN_INFO "[Filter] ✅ Hook registered!\n");
         printk(KERN_INFO "========================================\n");
-        printk(KERN_INFO "[Filter] 🧹 Anonymous executable lines will be hidden\n");
-        printk(KERN_INFO "[Filter] Other maps (stack, heap, libraries) remain\n");
+        printk(KERN_INFO "[Filter] 🧹 r-xp 00000000 lines hidden\n");
         printk(KERN_INFO "========================================\n");
         return 0;
-    } else {
-        printk(KERN_ERR "[Filter] ❌ Failed to register: %d\n", ret);
-        return ret;
     }
+    
+    printk(KERN_ERR "[Filter] ❌ Failed: %d\n", ret);
+    return ret;
 }
 
 /* ---------- 模块退出 ---------- */
