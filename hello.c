@@ -42,10 +42,7 @@ static unsigned long get_symbol_addr(const char *name)
 /* ---------- 检查行是否应该被保留 ---------- */
 static int should_keep_line(const char *line, unsigned long len)
 {
-    static int libart_rxp_count = 0;
     static int libart_rxp_done = 0;
-    unsigned long addr_start;
-    char *p;
     (void)len;
     
     /* 保留 vdso */
@@ -69,16 +66,12 @@ static int should_keep_line(const char *line, unsigned long len)
      * 规则2: libart.so r-xp 段只保留第一个
      * ============================================================ */
     if (strstr(line, "libart.so") != NULL && strstr(line, "r-xp") != NULL) {
-        /* 检查是否是 r-xp 权限 */
-        if (strstr(line, "r-xp") != NULL) {
-            /* 只保留第一个 r-xp 段 */
-            if (libart_rxp_done == 0) {
-                libart_rxp_done = 1;
-                printk(KERN_INFO "[Filter] ✅ Keep first libart.so r-xp: %s\n", line);
-                return 1;  /* 保留第一个 */
-            } else {
-                return 0;  /* 隐藏后续的 */
-            }
+        if (libart_rxp_done == 0) {
+            libart_rxp_done = 1;
+            printk(KERN_INFO "[Filter] ✅ Keep first libart.so r-xp\n");
+            return 1;
+        } else {
+            return 0;
         }
     }
     
@@ -90,12 +83,23 @@ static int should_keep_line(const char *line, unsigned long len)
     return 1;
 }
 
+/* ---------- 重置计数器（每个进程独立） ---------- */
+static void reset_libart_count(void)
+{
+    /* 使用 static 变量，每次过滤时重置 */
+    /* 在 filter_maps_lines 中通过函数参数传递 */
+}
+
 /* ---------- 过滤 maps ---------- */
 static void filter_maps_lines(struct seq_file *m)
 {
     char *buf, *src, *dst, *line_start, *line_end;
     unsigned long count, src_pos, dst_pos, remaining, line_len;
     int hidden_count = 0;
+    static int libart_rxp_done = 0;
+    
+    /* 每次读取 maps 时重置计数器 */
+    libart_rxp_done = 0;
     
     if (!m || !m->buf || m->count == 0) return;
     
@@ -114,7 +118,7 @@ static void filter_maps_lines(struct seq_file *m)
             line_start = src + src_pos;
             line_len = remaining;
             
-            if (should_keep_line(line_start, line_len)) {
+            if (should_keep_line_with_state(line_start, line_len, &libart_rxp_done)) {
                 if (dst_pos != src_pos) {
                     memmove(dst + dst_pos, line_start, line_len);
                 }
@@ -129,7 +133,7 @@ static void filter_maps_lines(struct seq_file *m)
         line_start = src + src_pos;
         line_len = (unsigned long)(line_end - line_start) + 1;
         
-        if (should_keep_line(line_start, line_len)) {
+        if (should_keep_line_with_state(line_start, line_len, &libart_rxp_done)) {
             if (dst_pos != src_pos) {
                 memmove(dst + dst_pos, line_start, line_len);
             }
@@ -149,6 +153,45 @@ static void filter_maps_lines(struct seq_file *m)
     if (m->count < m->size) {
         m->buf[m->count] = '\0';
     }
+}
+
+/* ---------- 检查行是否应该被保留（带状态） ---------- */
+static int should_keep_line_with_state(const char *line, unsigned long len, int *libart_rxp_done)
+{
+    (void)len;
+    
+    /* 保留 vdso */
+    if (strstr(line, "[vdso]") != NULL) {
+        return 1;
+    }
+    
+    /* 规则1: 隐藏 r-xp/rwxp 00000000 匿名映射 */
+    if (strstr(line, "00000000") != NULL) {
+        if (strstr(line, "r-xp") != NULL || strstr(line, "rwxp") != NULL) {
+            if (strstr(line, "/") != NULL) {
+                return 1;
+            }
+            return 0;
+        }
+    }
+    
+    /* 规则2: libart.so r-xp 段只保留第一个 */
+    if (strstr(line, "libart.so") != NULL && strstr(line, "r-xp") != NULL) {
+        if (*libart_rxp_done == 0) {
+            *libart_rxp_done = 1;
+            printk(KERN_INFO "[Filter] ✅ Keep first libart.so r-xp\n");
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+    
+    /* 保留非 r-xp 的 libart.so（如 ---p） */
+    if (strstr(line, "libart.so") != NULL) {
+        return 1;
+    }
+    
+    return 1;
 }
 
 /* ---------- show_map post_handler ---------- */
@@ -211,7 +254,7 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     filter_maps_lines(m);
 }
 
-/* ---------- 重置计数器（每个进程独立） ---------- */
+/* ---------- 模块初始化 ---------- */
 static int __init filter_init(void)
 {
     int ret;
