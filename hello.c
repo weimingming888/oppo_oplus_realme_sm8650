@@ -31,29 +31,40 @@ static unsigned long get_symbol_addr(const char *name)
     return addr;
 }
 
-/* ---------- 检查是否是纯 r-xp 00000000（后面没有字符） ---------- */
-static int is_pure_anonymous(const char *line)
+/* ---------- 检查是否应该隐藏 ---------- */
+static int should_hide(const char *line)
 {
-    const char *p;
-    
-    /* 查找 r-xp 00000000 */
-    p = strstr(line, "r-xp 00000000");
-    if (p == NULL) {
-        return 0;
-    }
-    
-    /* 检查后面是否还有非空字符 */
-    p += 14; /* 跳过 "r-xp 00000000" */
-    while (*p == ' ' || *p == '\t') {
-        p++;
-    }
-    
-    /* 如果后面是换行或结束，就是纯匿名 */
-    if (*p == '\n' || *p == '\r' || *p == '\0') {
+    /* 规则1: 任何包含 rwxp 的行都隐藏 */
+    if (strstr(line, "rwxp") != NULL) {
         return 1;
     }
     
-    /* 如果后面有 [vdso] 或其他字符，放行 */
+    /* 规则2: r-xp 00000000 行，后面有字符才放行 */
+    if (strstr(line, "r-xp 00000000") != NULL) {
+        /* 有 [vdso] 的保留 */
+        if (strstr(line, "[vdso]") != NULL) {
+            return 0;
+        }
+        /* 有文件路径的保留 */
+        if (strstr(line, "/") != NULL) {
+            return 0;
+        }
+        /* 检查后面是否还有非空字符（除了空格） */
+        const char *p = strstr(line, "r-xp 00000000");
+        if (p != NULL) {
+            p += 14; /* 跳过 "r-xp 00000000" */
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+            /* 如果后面还有非空字符（如 00:00 0），隐藏 */
+            if (*p != '\n' && *p != '\r' && *p != '\0') {
+                return 1;  /* 隐藏 */
+            }
+        }
+        return 1;  /* 纯的也隐藏 */
+    }
+    
+    /* 其他全部放行 */
     return 0;
 }
 
@@ -106,19 +117,9 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
             
             printk(KERN_INFO "[Filter] LINE %d: %s\n", line_num, line_copy);
             
-            /* 保留 vdso */
-            if (strstr(line_start, "[vdso]") != NULL) {
-                printk(KERN_INFO "[Filter] ✅ KEEP (vdso)\n");
-                if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
-                dst_pos += line_len;
-                src_pos = count;
-                break;
-            }
-            
-            /* 只有纯 r-xp 00000000（后面没有字符）才隐藏 */
-            if (is_pure_anonymous(line_start)) {
+            if (should_hide(line_start)) {
                 hidden++;
-                printk(KERN_INFO "[Filter] ❌ HIDE (pure anonymous)\n");
+                printk(KERN_INFO "[Filter] ❌ HIDE\n");
             } else {
                 printk(KERN_INFO "[Filter] ✅ KEEP\n");
                 if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
@@ -140,19 +141,9 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
         
         printk(KERN_INFO "[Filter] LINE %d: %s\n", line_num, line_copy);
         
-        /* 保留 vdso */
-        if (strstr(line_start, "[vdso]") != NULL) {
-            printk(KERN_INFO "[Filter] ✅ KEEP (vdso)\n");
-            if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
-            dst_pos += line_len;
-            src_pos += line_len;
-            continue;
-        }
-        
-        /* 只有纯 r-xp 00000000（后面没有字符）才隐藏 */
-        if (is_pure_anonymous(line_start)) {
+        if (should_hide(line_start)) {
             hidden++;
-            printk(KERN_INFO "[Filter] ❌ HIDE (pure anonymous)\n");
+            printk(KERN_INFO "[Filter] ❌ HIDE\n");
         } else {
             printk(KERN_INFO "[Filter] ✅ KEEP\n");
             if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
@@ -174,9 +165,10 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
 static int __init filter_init(void)
 {
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] Pure anonymous filter\n");
-    printk(KERN_INFO "[Filter] r-xp 00000000 with no trailing chars -> HIDE\n");
-    printk(KERN_INFO "[Filter] r-xp 00000000 with [vdso] -> KEEP\n");
+    printk(KERN_INFO "[Filter] Rules:\n");
+    printk(KERN_INFO "  1. rwxp -> HIDE\n");
+    printk(KERN_INFO "  2. r-xp 00000000 00:00 0 -> HIDE\n");
+    printk(KERN_INFO "  3. r-xp 00000000 [vdso] -> KEEP\n");
     printk(KERN_INFO "========================================\n");
     
     g_show_map_addr = get_symbol_addr("show_map");
@@ -198,8 +190,6 @@ static int __init filter_init(void)
     
     if (register_kprobe(&kp_show_map) == 0) {
         printk(KERN_INFO "[Filter] ✅ Hook registered\n");
-        printk(KERN_INFO "[Filter] ✅ Pure r-xp 00000000 hidden\n");
-        printk(KERN_INFO "[Filter] ✅ r-xp 00000000 [vdso] preserved\n");
         return 0;
     }
     
