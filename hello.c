@@ -42,6 +42,10 @@ static unsigned long get_symbol_addr(const char *name)
 /* ---------- 检查行是否应该被保留 ---------- */
 static int should_keep_line(const char *line, unsigned long len)
 {
+    static int libart_rxp_count = 0;
+    static int libart_rxp_done = 0;
+    unsigned long addr_start;
+    char *p;
     (void)len;
     
     /* 保留 vdso */
@@ -49,21 +53,38 @@ static int should_keep_line(const char *line, unsigned long len)
         return 1;
     }
     
-    /* 规则1: 隐藏所有 libart.so */
-    if (strstr(line, "libart.so") != NULL) {
-        return 0;
-    }
-    
-    /* 规则2: 隐藏 r-xp/rwxp 00000000 匿名映射 */
+    /* ============================================================
+     * 规则1: 隐藏 r-xp/rwxp 00000000 匿名映射
+     * ============================================================ */
     if (strstr(line, "00000000") != NULL) {
         if (strstr(line, "r-xp") != NULL || strstr(line, "rwxp") != NULL) {
-            /* 有文件路径的保留 */
             if (strstr(line, "/") != NULL) {
                 return 1;
             }
-            /* 无文件路径的隐藏（匿名映射） */
             return 0;
         }
+    }
+    
+    /* ============================================================
+     * 规则2: libart.so r-xp 段只保留第一个
+     * ============================================================ */
+    if (strstr(line, "libart.so") != NULL && strstr(line, "r-xp") != NULL) {
+        /* 检查是否是 r-xp 权限 */
+        if (strstr(line, "r-xp") != NULL) {
+            /* 只保留第一个 r-xp 段 */
+            if (libart_rxp_done == 0) {
+                libart_rxp_done = 1;
+                printk(KERN_INFO "[Filter] ✅ Keep first libart.so r-xp: %s\n", line);
+                return 1;  /* 保留第一个 */
+            } else {
+                return 0;  /* 隐藏后续的 */
+            }
+        }
+    }
+    
+    /* 保留非 r-xp 的 libart.so（如 ---p） */
+    if (strstr(line, "libart.so") != NULL) {
+        return 1;
     }
     
     return 1;
@@ -190,7 +211,7 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     filter_maps_lines(m);
 }
 
-/* ---------- 模块初始化 ---------- */
+/* ---------- 重置计数器（每个进程独立） ---------- */
 static int __init filter_init(void)
 {
     int ret;
@@ -199,8 +220,8 @@ static int __init filter_init(void)
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "[Filter] ENHANCED FILTER\n");
     printk(KERN_INFO "[Filter] Rules:\n");
-    printk(KERN_INFO "  1. r-xp/rwxp 00000000 [anonymous]\n");
-    printk(KERN_INFO "  2. ALL /apex/.../libart.so\n");
+    printk(KERN_INFO "  1. r-xp/rwxp 00000000 [anonymous] -> HIDE\n");
+    printk(KERN_INFO "  2. libart.so r-xp -> ONLY KEEP FIRST\n");
     printk(KERN_INFO "========================================\n");
     
     g_show_map_addr = get_symbol_addr("show_map");
@@ -246,7 +267,7 @@ static int __init filter_init(void)
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "[Filter] ✅ %d hook(s) registered\n", hooks);
     printk(KERN_INFO "[Filter] ✅ r-xp/rwxp 00000000 hidden\n");
-    printk(KERN_INFO "[Filter] ✅ libart.so hidden\n");
+    printk(KERN_INFO "[Filter] ✅ libart.so r-xp: only first kept\n");
     printk(KERN_INFO "========================================\n");
     return 0;
 }
