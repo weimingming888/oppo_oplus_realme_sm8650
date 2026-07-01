@@ -34,6 +34,11 @@ static unsigned long get_symbol_addr(const char *name)
 /* ---------- 检查是否应该隐藏 ---------- */
 static int should_hide(const char *line)
 {
+    const char *p;
+    int hide;
+    
+    hide = 0;
+    
     /* 规则1: 任何包含 rwxp 的行都隐藏 */
     if (strstr(line, "rwxp") != NULL) {
         return 1;
@@ -50,7 +55,7 @@ static int should_hide(const char *line)
             return 0;
         }
         /* 检查后面是否还有非空字符（除了空格） */
-        const char *p = strstr(line, "r-xp 00000000");
+        p = strstr(line, "r-xp 00000000");
         if (p != NULL) {
             p += 14; /* 跳过 "r-xp 00000000" */
             while (*p == ' ' || *p == '\t') {
@@ -167,8 +172,7 @@ static int __init filter_init(void)
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "[Filter] Rules:\n");
     printk(KERN_INFO "  1. rwxp -> HIDE\n");
-    printk(KERN_INFO "  2. r-xp 00000000 00:00 0 -> HIDE\n");
-    printk(KERN_INFO "  3. r-xp 00000000 [vdso] -> KEEP\n");
+    printk(KERN_INFO "  2. r-xp 00000000 -> HIDE (except [vdso] and /)\n");
     printk(KERN_INFO "========================================\n");
     
     g_show_map_addr = get_symbol_addr("show_map");
