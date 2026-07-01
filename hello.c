@@ -39,10 +39,9 @@ static unsigned long get_symbol_addr(const char *name)
     return addr;
 }
 
-/* ---------- 检查行是否应该被保留 ---------- */
-static int should_keep_line(const char *line, unsigned long len)
+/* ---------- 检查行是否应该被保留（带状态） ---------- */
+static int should_keep_line_with_state(const char *line, unsigned long len, int *libart_rxp_done)
 {
-    static int libart_rxp_done = 0;
     (void)len;
     
     /* 保留 vdso */
@@ -50,9 +49,7 @@ static int should_keep_line(const char *line, unsigned long len)
         return 1;
     }
     
-    /* ============================================================
-     * 规则1: 隐藏 r-xp/rwxp 00000000 匿名映射
-     * ============================================================ */
+    /* 规则1: 隐藏 r-xp/rwxp 00000000 匿名映射 */
     if (strstr(line, "00000000") != NULL) {
         if (strstr(line, "r-xp") != NULL || strstr(line, "rwxp") != NULL) {
             if (strstr(line, "/") != NULL) {
@@ -62,12 +59,10 @@ static int should_keep_line(const char *line, unsigned long len)
         }
     }
     
-    /* ============================================================
-     * 规则2: libart.so r-xp 段只保留第一个
-     * ============================================================ */
+    /* 规则2: libart.so r-xp 段只保留第一个 */
     if (strstr(line, "libart.so") != NULL && strstr(line, "r-xp") != NULL) {
-        if (libart_rxp_done == 0) {
-            libart_rxp_done = 1;
+        if (*libart_rxp_done == 0) {
+            *libart_rxp_done = 1;
             printk(KERN_INFO "[Filter] ✅ Keep first libart.so r-xp\n");
             return 1;
         } else {
@@ -83,23 +78,13 @@ static int should_keep_line(const char *line, unsigned long len)
     return 1;
 }
 
-/* ---------- 重置计数器（每个进程独立） ---------- */
-static void reset_libart_count(void)
-{
-    /* 使用 static 变量，每次过滤时重置 */
-    /* 在 filter_maps_lines 中通过函数参数传递 */
-}
-
 /* ---------- 过滤 maps ---------- */
 static void filter_maps_lines(struct seq_file *m)
 {
     char *buf, *src, *dst, *line_start, *line_end;
     unsigned long count, src_pos, dst_pos, remaining, line_len;
     int hidden_count = 0;
-    static int libart_rxp_done = 0;
-    
-    /* 每次读取 maps 时重置计数器 */
-    libart_rxp_done = 0;
+    int libart_rxp_done = 0;
     
     if (!m || !m->buf || m->count == 0) return;
     
@@ -153,45 +138,6 @@ static void filter_maps_lines(struct seq_file *m)
     if (m->count < m->size) {
         m->buf[m->count] = '\0';
     }
-}
-
-/* ---------- 检查行是否应该被保留（带状态） ---------- */
-static int should_keep_line_with_state(const char *line, unsigned long len, int *libart_rxp_done)
-{
-    (void)len;
-    
-    /* 保留 vdso */
-    if (strstr(line, "[vdso]") != NULL) {
-        return 1;
-    }
-    
-    /* 规则1: 隐藏 r-xp/rwxp 00000000 匿名映射 */
-    if (strstr(line, "00000000") != NULL) {
-        if (strstr(line, "r-xp") != NULL || strstr(line, "rwxp") != NULL) {
-            if (strstr(line, "/") != NULL) {
-                return 1;
-            }
-            return 0;
-        }
-    }
-    
-    /* 规则2: libart.so r-xp 段只保留第一个 */
-    if (strstr(line, "libart.so") != NULL && strstr(line, "r-xp") != NULL) {
-        if (*libart_rxp_done == 0) {
-            *libart_rxp_done = 1;
-            printk(KERN_INFO "[Filter] ✅ Keep first libart.so r-xp\n");
-            return 1;
-        } else {
-            return 0;
-        }
-    }
-    
-    /* 保留非 r-xp 的 libart.so（如 ---p） */
-    if (strstr(line, "libart.so") != NULL) {
-        return 1;
-    }
-    
-    return 1;
 }
 
 /* ---------- show_map post_handler ---------- */
