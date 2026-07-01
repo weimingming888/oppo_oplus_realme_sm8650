@@ -10,9 +10,7 @@
 MODULE_LICENSE("GPL");
 
 static struct kprobe kp_show_map;
-static struct kprobe kp_seq_read;
 static unsigned long g_show_map_addr;
-static unsigned long g_seq_read_addr;
 
 static int hook_count = 0;
 static int filter_count = 0;
@@ -135,7 +133,6 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
     (void)flags;
     
     /* show_map 的函数签名: int show_map(struct seq_file *m, void *v) */
-    /* 第一个参数在 x0 寄存器 */
 #if defined(CONFIG_ARM64)
     m = (struct seq_file *)regs->regs[0];
 #elif defined(CONFIG_X86_64)
@@ -149,41 +146,6 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
     }
 }
 
-/* ---------- seq_read post_handler ---------- */
-static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
-{
-    struct file *file;
-    struct seq_file *m;
-    ssize_t ret;
-    const char *name;
-    
-    (void)p;
-    (void)flags;
-    
-    /* ============================================================
-     * ARM64:
-     *   seq_read 函数执行后，x0 是返回值
-     *   但第一个参数 file 在函数执行后可能被覆盖了
-     *   正确的做法：从 file->private_data 获取 seq_file
-     * ============================================================ */
-    
-    /* 在 post_handler 中，x0 是返回值（ssize_t） */
-#if defined(CONFIG_ARM64)
-    ret = (ssize_t)regs->regs[0];
-    /* 没有办法获取 file 参数了，因为 x0 已经被返回值覆盖 */
-    /* 但我们可以从 current 的 fd 表中找？太复杂了 */
-    /* 更好的方案：使用 pre_handler 保存 file 指针 */
-#elif defined(CONFIG_X86_64)
-    file = (struct file *)regs->di;
-    ret = (ssize_t)regs->ax;
-#else
-    file = NULL;
-    ret = 0;
-#endif
-    
-    /* 暂时只支持 x86_64，ARM64 使用 show_map 就够了 */
-}
-
 /* ---------- 模块初始化 ---------- */
 static int __init filter_init(void)
 {
@@ -191,7 +153,7 @@ static int __init filter_init(void)
     
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "[Filter] ENHANCED FILTER\n");
-    printk(KERN_INFO "[Filter] Fixed ARM64 register handling\n");
+    printk(KERN_INFO "[Filter] Hooking show_map only\n");
     printk(KERN_INFO "========================================\n");
     
     g_show_map_addr = get_symbol_addr("show_map");
