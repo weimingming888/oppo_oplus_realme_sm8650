@@ -8,11 +8,15 @@
 #include <linux/string.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Global Filter");
-MODULE_DESCRIPTION("Globally filter r-xp 00000000 anonymous memory");
+MODULE_AUTHOR("Multi Hook Filter");
+MODULE_DESCRIPTION("Filter r-xp 00000000 via multiple hooks");
 
 static struct kprobe kp_show_map;
+static struct kprobe kp_seq_read;
+static struct kprobe kp_proc_reg_read;
 static unsigned long g_show_map_addr;
+static unsigned long g_seq_read_addr;
+static unsigned long g_proc_reg_read_addr;
 
 /* ---------- 通过 kprobe 获取符号地址 ---------- */
 static unsigned long get_symbol_addr(const char *name)
@@ -42,22 +46,18 @@ static int should_hide_line(const char *line, unsigned long len)
 {
     (void)len;
     
-    /* 必须包含 r-xp 00000000 */
     if (strstr(line, "r-xp 00000000") == NULL) {
         return 0;
     }
     
-    /* [vdso] 是系统组件，保留 */
     if (strstr(line, "[vdso]") != NULL) {
         return 0;
     }
     
-    /* 有文件路径的保留（如 .so） */
     if (strstr(line, "/") != NULL) {
         return 0;
     }
     
-    /* 其他所有 r-xp 00000000 都隐藏（LSPosed 注入代码） */
     return 1;
 }
 
@@ -122,7 +122,7 @@ static void filter_maps_lines(struct seq_file *m)
     }
 }
 
-/* ---------- show_map post_handler（全局，不限制进程） ---------- */
+/* ---------- show_map post_handler ---------- */
 static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
                                   unsigned long flags)
 {
@@ -140,6 +140,45 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
 #endif
     
     if (!m) return;
+    filter_maps_lines(m);
+}
+
+/* ---------- seq_read post_handler ---------- */
+static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
+                                  unsigned long flags)
+{
+    struct file *file;
+    struct seq_file *m;
+    ssize_t ret;
+    
+    (void)p;
+    (void)flags;
+    
+#if defined(CONFIG_ARM64)
+    file = (struct file *)regs->regs[0];
+    ret = (ssize_t)regs->regs[0];
+#elif defined(CONFIG_X86_64)
+    file = (struct file *)regs->di;
+    ret = (ssize_t)regs->ax;
+#else
+    file = NULL;
+    ret = 0;
+#endif
+    
+    if (!file || ret <= 0) return;
+    
+    /* 检查是否是 maps 文件 */
+    if (file->f_path.dentry && file->f_path.dentry->d_name.name) {
+        const char *name = file->f_path.dentry->d_name.name;
+        if (strcmp(name, "maps") != 0 && strcmp(name, "smaps") != 0) {
+            return;
+        }
+    } else {
+        return;
+    }
+    
+    m = (struct seq_file *)file->private_data;
+    if (!m) return;
     
     filter_maps_lines(m);
 }
@@ -148,12 +187,14 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
 static int __init filter_init(void)
 {
     int ret;
+    int hooks = 0;
     
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] GLOBAL r-xp 00000000 filter\n");
-    printk(KERN_INFO "[Filter] All processes affected\n");
+    printk(KERN_INFO "[Filter] MULTI HOOK filter\n");
+    printk(KERN_INFO "[Filter] Hooking: show_map + seq_read\n");
     printk(KERN_INFO "========================================\n");
     
+    /* 1. show_map */
     g_show_map_addr = get_symbol_addr("show_map");
     if (!g_show_map_addr) {
         g_show_map_addr = get_symbol_addr("show_map_vma");
@@ -162,33 +203,52 @@ static int __init filter_init(void)
         g_show_map_addr = get_symbol_addr("proc_pid_maps_show");
     }
     
-    if (!g_show_map_addr) {
-        printk(KERN_ERR "[Filter] ❌ show_map not found!\n");
+    if (g_show_map_addr) {
+        memset(&kp_show_map, 0, sizeof(struct kprobe));
+        kp_show_map.addr = (void *)g_show_map_addr;
+        kp_show_map.post_handler = show_map_post_handler;
+        ret = register_kprobe(&kp_show_map);
+        if (ret == 0) {
+            hooks++;
+            printk(KERN_INFO "[Filter] ✅ show_map hook registered\n");
+        }
+    }
+    
+    /* 2. seq_read */
+    g_seq_read_addr = get_symbol_addr("seq_read");
+    if (!g_seq_read_addr) {
+        g_seq_read_addr = get_symbol_addr("proc_reg_read");
+    }
+    
+    if (g_seq_read_addr) {
+        memset(&kp_seq_read, 0, sizeof(struct kprobe));
+        kp_seq_read.addr = (void *)g_seq_read_addr;
+        kp_seq_read.post_handler = seq_read_post_handler;
+        ret = register_kprobe(&kp_seq_read);
+        if (ret == 0) {
+            hooks++;
+            printk(KERN_INFO "[Filter] ✅ seq_read hook registered\n");
+        }
+    }
+    
+    if (hooks == 0) {
+        printk(KERN_ERR "[Filter] ❌ No hooks registered!\n");
         return -ENOENT;
     }
     
-    memset(&kp_show_map, 0, sizeof(struct kprobe));
-    kp_show_map.addr = (void *)g_show_map_addr;
-    kp_show_map.post_handler = show_map_post_handler;
-    
-    ret = register_kprobe(&kp_show_map);
-    if (ret == 0) {
-        printk(KERN_INFO "[Filter] ✅ Hook registered!\n");
-        printk(KERN_INFO "========================================\n");
-        printk(KERN_INFO "[Filter] 🧹 GLOBAL: r-xp 00000000 hidden\n");
-        printk(KERN_INFO "[Filter] ✅ [vdso] preserved\n");
-        printk(KERN_INFO "========================================\n");
-        return 0;
-    }
-    
-    printk(KERN_ERR "[Filter] ❌ Failed: %d\n", ret);
-    return ret;
+    printk(KERN_INFO "========================================\n");
+    printk(KERN_INFO "[Filter] ✅ %d hook(s) registered\n", hooks);
+    printk(KERN_INFO "[Filter] ✅ r-xp 00000000 hidden (ALL paths)\n");
+    printk(KERN_INFO "========================================\n");
+    return 0;
 }
 
 /* ---------- 模块退出 ---------- */
 static void __exit filter_exit(void)
 {
     unregister_kprobe(&kp_show_map);
+    unregister_kprobe(&kp_seq_read);
+    unregister_kprobe(&kp_proc_reg_read);
     printk(KERN_INFO "[Filter] Unloaded\n");
 }
 
