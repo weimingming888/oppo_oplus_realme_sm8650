@@ -7,8 +7,8 @@ MODULE_LICENSE("GPL");
 #define PATTERN_WORD1 0xa9bf7bfd  /* stp x29, x30, [sp, #-32]! */
 #define PATTERN_WORD2 0x910003fd  /* mov x29, sp */
 
-/* ---------- 手动比较两个 8 字节块（不用 memcmp） ---------- */
-static int manual_match(const unsigned char *a, const unsigned char *b)
+/* ---------- 手动比较 8 字节（不用 memcmp） ---------- */
+static int manual_match_8(const unsigned char *a, const unsigned char *b)
 {
     int i;
     for (i = 0; i < 8; i++) {
@@ -18,20 +18,19 @@ static int manual_match(const unsigned char *a, const unsigned char *b)
     return 1;
 }
 
-/* ---------- 通过内联汇编读取内存（不用 probe_kernel_read） ---------- */
+/* ---------- 通过内联汇编读取 8 字节（带异常保护） ---------- */
 static int read_memory_8(unsigned long addr, unsigned char *buf)
 {
     unsigned long val;
     int ret = 0;
     
-    /* 使用内联汇编直接读取 */
     __asm__ volatile(
         "1: ldr %0, [%2]\n"
-        "   mov %1, #0\n"
+        "   mov %w1, wzr\n"          /* 使用 w1 寄存器（32位） */
         "2:\n"
         ".pushsection .fixup,\"ax\"\n"
-        "3: mov %1, #1\n"
-        "   mov %0, #0\n"
+        "3: mov %w1, #1\n"           /* 使用 w1 寄存器 */
+        "   mov %0, xzr\n"
         "   b 2b\n"
         ".popsection\n"
         ".pushsection __ex_table,\"a\"\n"
@@ -44,7 +43,6 @@ static int read_memory_8(unsigned long addr, unsigned char *buf)
     );
     
     if (ret == 0) {
-        /* 复制到 buf（小端） */
         buf[0] = val & 0xff;
         buf[1] = (val >> 8) & 0xff;
         buf[2] = (val >> 16) & 0xff;
@@ -57,50 +55,19 @@ static int read_memory_8(unsigned long addr, unsigned char *buf)
     return ret;
 }
 
-/* ---------- 主查找函数 ---------- */
-static unsigned long find_kallsyms_lookup_name(void)
-{
-    unsigned long p;
-    unsigned char buf[8];
-    const unsigned char pattern[] = {
-        0xfd, 0x7b, 0xbf, 0xa9,
-        0xfd, 0x03, 0x00, 0x91,
-    };
-    
-    /* 扫描内核文本段 */
-    for (p = 0xffffff8000000000ULL; p < 0xfffffffe00000000ULL; p += 4) {
-        /* 每扫描 1MB 放一次行，避免看门狗超时 */
-        if ((p & 0xFFFFF) == 0) {
-            /* 空转，不调用任何函数 */
-        }
-        
-        if (read_memory_8(p, buf) == 0) {
-            if (manual_match(buf, pattern)) {
-                return p;
-            }
-        }
-        
-        /* 防止无限循环 */
-        if (p > 0xfffffffe00000000ULL)
-            break;
-    }
-    return 0;
-}
-
-/* ---------- 验证找到的地址 ---------- */
-static int verify_address(unsigned long addr)
+/* ---------- 验证地址是否可读 ---------- */
+static int verify_address_readable(unsigned long addr)
 {
     unsigned long val;
-    int ret;
+    int ret = 0;
     
-    /* 尝试读取 addr 处的第一条指令 */
     __asm__ volatile(
         "1: ldr %0, [%2]\n"
-        "   mov %1, #0\n"
+        "   mov %w1, wzr\n"
         "2:\n"
         ".pushsection .fixup,\"ax\"\n"
-        "3: mov %1, #1\n"
-        "   mov %0, #0\n"
+        "3: mov %w1, #1\n"
+        "   mov %0, xzr\n"
         "   b 2b\n"
         ".popsection\n"
         ".pushsection __ex_table,\"a\"\n"
@@ -112,14 +79,41 @@ static int verify_address(unsigned long addr)
         : "memory"
     );
     
-    if (ret == 0) {
-        printk(KERN_INFO "Address 0x%lx is readable, first instr: 0x%08lx\n", 
-               addr, val & 0xffffffff);
-        return 1;
-    } else {
-        printk(KERN_WARNING "Address 0x%lx is NOT readable\n", addr);
-        return 0;
+    return (ret == 0);
+}
+
+/* ---------- 扫描查找 kallsyms_lookup_name ---------- */
+static unsigned long find_kallsyms_lookup_name(void)
+{
+    unsigned long p;
+    unsigned char buf[8];
+    const unsigned char pattern[8] = {
+        0xfd, 0x7b, 0xbf, 0xa9,  /* stp x29, x30, [sp, #-32]! */
+        0xfd, 0x03, 0x00, 0x91,  /* mov x29, sp */
+    };
+    unsigned long start, end;
+    
+    /* ARM64 内核文本段范围 */
+    start = 0xffffff8000000000ULL;
+    end = 0xfffffffe00000000ULL;
+    
+    printk(KERN_INFO "Scanning 0x%lx - 0x%lx\n", start, end);
+    
+    for (p = start; p < end; p += 4) {
+        /* 每 16MB 打印一次进度 */
+        if ((p & 0xFFFFFF) == 0) {
+            printk(KERN_DEBUG "Scanning at 0x%lx\n", p);
+        }
+        
+        if (read_memory_8(p, buf) == 0) {
+            if (manual_match_8(buf, pattern)) {
+                printk(KERN_INFO "Found signature at 0x%lx\n", p);
+                return p;
+            }
+        }
     }
+    
+    return 0;
 }
 
 /* ---------- 模块初始化 ---------- */
@@ -128,20 +122,29 @@ static int __init finder_init(void)
     unsigned long addr;
     
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "kallsyms_lookup_name Finder (Zero Symbol)\n");
+    printk(KERN_INFO "kallsyms_lookup_name Finder\n");
+    printk(KERN_INFO "(Zero Symbol Dependencies)\n");
     printk(KERN_INFO "========================================\n");
     
     addr = find_kallsyms_lookup_name();
+    
     if (addr) {
-        printk(KERN_INFO "Found signature at: 0x%lx\n", addr);
-        if (verify_address(addr)) {
-            printk(KERN_INFO "✅ SUCCESS! kallsyms_lookup_name = 0x%lx\n", addr);
+        printk(KERN_INFO "✅ Found at: 0x%lx\n", addr);
+        
+        /* 验证地址可读 */
+        if (verify_address_readable(addr)) {
+            printk(KERN_INFO "✅ Address is readable and valid\n");
+            printk(KERN_INFO "\n");
+            printk(KERN_INFO "🔑 kallsyms_lookup_name = 0x%lx\n", addr);
             printk(KERN_INFO "========================================\n");
             return 0;
+        } else {
+            printk(KERN_WARNING "⚠️  Address not readable\n");
         }
+    } else {
+        printk(KERN_ERR "❌ Not found\n");
     }
     
-    printk(KERN_ERR "❌ Failed to find kallsyms_lookup_name\n");
     printk(KERN_INFO "========================================\n");
     return -ENOENT;
 }
