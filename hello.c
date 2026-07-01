@@ -84,6 +84,7 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
             
             printk(KERN_INFO "[Filter] LINE %d: %s\n", line_num, line_copy);
             
+            /* 保留 vdso */
             if (strstr(line_start, "[vdso]") != NULL) {
                 printk(KERN_INFO "[Filter] ✅ KEEP (vdso)\n");
                 if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
@@ -92,9 +93,11 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
                 break;
             }
             
-            if (strstr(line_start, "rwxp") != NULL) {
+            /* 隐藏 r-xp 00000000 或 rwxp */
+            if (strstr(line_start, "r-xp 00000000") != NULL ||
+                strstr(line_start, "rwxp") != NULL) {
                 hidden++;
-                printk(KERN_INFO "[Filter] ❌ HIDE (rwxp)\n");
+                printk(KERN_INFO "[Filter] ❌ HIDE (anonymous executable)\n");
             } else {
                 printk(KERN_INFO "[Filter] ✅ KEEP\n");
                 if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
@@ -116,6 +119,7 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
         
         printk(KERN_INFO "[Filter] LINE %d: %s\n", line_num, line_copy);
         
+        /* 保留 vdso */
         if (strstr(line_start, "[vdso]") != NULL) {
             printk(KERN_INFO "[Filter] ✅ KEEP (vdso)\n");
             if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
@@ -124,9 +128,11 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
             continue;
         }
         
-        if (strstr(line_start, "rwxp") != NULL) {
+        /* 隐藏 r-xp 00000000 或 rwxp */
+        if (strstr(line_start, "r-xp 00000000") != NULL ||
+            strstr(line_start, "rwxp") != NULL) {
             hidden++;
-            printk(KERN_INFO "[Filter] ❌ HIDE (rwxp)\n");
+            printk(KERN_INFO "[Filter] ❌ HIDE (anonymous executable)\n");
         } else {
             printk(KERN_INFO "[Filter] ✅ KEEP\n");
             if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
@@ -148,7 +154,8 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
 static int __init filter_init(void)
 {
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] DEBUG: rwxp filter with line dump\n");
+    printk(KERN_INFO "[Filter] Filter: r-xp 00000000 + rwxp\n");
+    printk(KERN_INFO "[Filter] vdso preserved\n");
     printk(KERN_INFO "========================================\n");
     
     g_show_map_addr = get_symbol_addr("show_map");
@@ -170,7 +177,8 @@ static int __init filter_init(void)
     
     if (register_kprobe(&kp_show_map) == 0) {
         printk(KERN_INFO "[Filter] ✅ Hook registered\n");
-        printk(KERN_INFO "[Filter] Open any app to see maps dump\n");
+        printk(KERN_INFO "[Filter] ✅ r-xp 00000000 + rwxp filtered\n");
+        printk(KERN_INFO "[Filter] ✅ [vdso] preserved\n");
         return 0;
     }
     
