@@ -5,10 +5,11 @@
 #include <linux/fs.h>
 #include <linux/dcache.h>
 #include <linux/sched.h>
+#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Global Seq Cleaner");
-MODULE_DESCRIPTION("Clear ALL /proc/pid/maps at seq_read level");
+MODULE_AUTHOR("Anonymous Exec Filter");
+MODULE_DESCRIPTION("Filter anonymous executable memory mappings globally");
 
 static struct kprobe kp_seq_read;
 static unsigned long g_seq_read_addr;
@@ -30,22 +31,19 @@ static unsigned long get_symbol_addr(const char *name)
     if (ret == 0) {
         addr = (unsigned long)kp.addr;
         unregister_kprobe(&kp);
-        printk(KERN_INFO "[Cleaner] ✅ %s = 0x%lx\n", name, addr);
+        printk(KERN_INFO "[Filter] ✅ %s = 0x%lx\n", name, addr);
     } else {
-        printk(KERN_WARNING "[Cleaner] ❌ %s NOT FOUND (err=%d)\n", name, ret);
+        printk(KERN_WARNING "[Filter] ❌ %s NOT FOUND (err=%d)\n", name, ret);
     }
     
     return addr;
 }
 
-/* ---------- 检查文件名是否是 maps ---------- */
+/* ---------- 检查是否为 maps 文件 ---------- */
 static int is_maps_file(struct file *file)
 {
     struct dentry *dentry;
     const char *name;
-    int result;
-    
-    result = 0;
     
     if (!file) {
         return 0;
@@ -64,13 +62,108 @@ static int is_maps_file(struct file *file)
     if (strcmp(name, "maps") == 0 ||
         strcmp(name, "smaps") == 0 ||
         strstr(name, "maps") == name) {
-        result = 1;
+        return 1;
     }
     
-    return result;
+    return 0;
 }
 
-/* ---------- seq_read post_handler：在最终输出前清空 ---------- */
+/* ---------- 检查一行是否是匿名可执行内存 ---------- */
+static int is_anonymous_executable(const char *line, unsigned long len)
+{
+    char lower[256];
+    int i;
+    
+    if (!line || len == 0) {
+        return 0;
+    }
+    
+    for (i = 0; i < len && i < 255; i++) {
+        lower[i] = (line[i] >= 'A' && line[i] <= 'Z') ?
+                   line[i] + 0x20 : line[i];
+    }
+    lower[i < 255 ? i : 255] = '\0';
+    
+    /* 检查是否有 'x' 权限（可执行） */
+    if (!strstr(lower, "x")) {
+        return 0;
+    }
+    
+    /* 检查是否是匿名映射（没有文件路径） */
+    if (strstr(lower, "[anonymous]") ||
+        strstr(lower, "[anon:") ||
+        strstr(lower, " 00:00 0 ")) {
+        return 1;
+    }
+    
+    return 0;
+}
+
+/* ---------- 过滤 maps 内容 ---------- */
+static void filter_maps_lines(struct seq_file *m)
+{
+    char *buf, *src, *dst, *line_start, *line_end;
+    unsigned long count, src_pos, dst_pos, remaining, line_len;
+    int hidden_count;
+    
+    if (!m || !m->buf || m->count == 0) {
+        return;
+    }
+    
+    hidden_count = 0;
+    buf = m->buf;
+    count = m->count;
+    src = buf;
+    dst = buf;
+    src_pos = 0;
+    dst_pos = 0;
+    
+    while (src_pos < count) {
+        remaining = count - src_pos;
+        line_end = memchr(src + src_pos, '\n', remaining);
+        
+        if (!line_end) {
+            line_start = src + src_pos;
+            line_len = remaining;
+            
+            if (!is_anonymous_executable(line_start, line_len)) {
+                if (dst_pos != src_pos) {
+                    memmove(dst + dst_pos, line_start, line_len);
+                }
+                dst_pos += line_len;
+            } else {
+                hidden_count++;
+            }
+            src_pos = count;
+            break;
+        }
+        
+        line_start = src + src_pos;
+        line_len = (unsigned long)(line_end - line_start) + 1;
+        
+        if (!is_anonymous_executable(line_start, line_len)) {
+            if (dst_pos != src_pos) {
+                memmove(dst + dst_pos, line_start, line_len);
+            }
+            dst_pos += line_len;
+        } else {
+            hidden_count++;
+        }
+        src_pos += line_len;
+    }
+    
+    if (hidden_count > 0) {
+        printk(KERN_INFO "[Filter] 🧹 Filtered %d anonymous executable lines for PID=%d\n",
+               hidden_count, current->pid);
+    }
+    
+    m->count = dst_pos;
+    if (m->count < m->size) {
+        m->buf[m->count] = '\0';
+    }
+}
+
+/* ---------- seq_read post_handler ---------- */
 static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
                                   unsigned long flags)
 {
@@ -105,24 +198,17 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
         return;
     }
     
-    /* 清空所有内容 */
-    m->count = 0;
-    if (m->buf) {
-        m->buf[0] = '\0';
-    }
-    
-    printk(KERN_INFO "[Cleaner] 🧹 seq_read cleared maps for PID=%d (%s)\n",
-           current->pid, current->comm);
+    filter_maps_lines(m);
 }
 
 /* ---------- 模块初始化 ---------- */
-static int __init cleaner_init(void)
+static int __init filter_init(void)
 {
     int ret;
     
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Cleaner] GLOBAL Seq Read Cleaner\n");
-    printk(KERN_INFO "[Cleaner] Will clear ALL /proc/pid/maps\n");
+    printk(KERN_INFO "[Filter] Anonymous Executable Memory Filter\n");
+    printk(KERN_INFO "[Filter] Global - all processes\n");
     printk(KERN_INFO "========================================\n");
     
     g_seq_read_addr = get_symbol_addr("seq_read");
@@ -131,11 +217,9 @@ static int __init cleaner_init(void)
     }
     
     if (!g_seq_read_addr) {
-        printk(KERN_ERR "[Cleaner] ❌ seq_read not found!\n");
+        printk(KERN_ERR "[Filter] ❌ seq_read not found!\n");
         return -ENOENT;
     }
-    
-    printk(KERN_INFO "[Cleaner] ✅ seq_read = 0x%lx\n", g_seq_read_addr);
     
     memset(&kp_seq_read, 0, sizeof(struct kprobe));
     kp_seq_read.addr = (void *)g_seq_read_addr;
@@ -143,23 +227,24 @@ static int __init cleaner_init(void)
     
     ret = register_kprobe(&kp_seq_read);
     if (ret == 0) {
-        printk(KERN_INFO "[Cleaner] ✅ Hook registered!\n");
+        printk(KERN_INFO "[Filter] ✅ Hook registered!\n");
         printk(KERN_INFO "========================================\n");
-        printk(KERN_INFO "[Cleaner] 🧹 ALL /proc/pid/maps are now EMPTY\n");
+        printk(KERN_INFO "[Filter] 🧹 Anonymous executable lines will be hidden\n");
+        printk(KERN_INFO "[Filter] Other maps (stack, heap, libraries) remain\n");
         printk(KERN_INFO "========================================\n");
         return 0;
     } else {
-        printk(KERN_ERR "[Cleaner] ❌ Failed to register: %d\n", ret);
+        printk(KERN_ERR "[Filter] ❌ Failed to register: %d\n", ret);
         return ret;
     }
 }
 
 /* ---------- 模块退出 ---------- */
-static void __exit cleaner_exit(void)
+static void __exit filter_exit(void)
 {
     unregister_kprobe(&kp_seq_read);
-    printk(KERN_INFO "[Cleaner] Unloaded - maps restored\n");
+    printk(KERN_INFO "[Filter] Unloaded\n");
 }
 
-module_init(cleaner_init);
-module_exit(cleaner_exit);
+module_init(filter_init);
+module_exit(filter_exit);
