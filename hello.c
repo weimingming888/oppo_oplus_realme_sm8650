@@ -8,11 +8,11 @@
 #include <linux/string.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Anonymous Exec Filter");
-MODULE_DESCRIPTION("Filter r-xp 00000000 anonymous memory");
+MODULE_AUTHOR("ShowMap Filter");
+MODULE_DESCRIPTION("Filter r-xp 00000000 via show_map");
 
-static struct kprobe kp_seq_read;
-static unsigned long g_seq_read_addr;
+static struct kprobe kp_show_map;
+static unsigned long g_show_map_addr;
 
 /* ---------- 通过 kprobe 获取符号地址 ---------- */
 static unsigned long get_symbol_addr(const char *name)
@@ -32,124 +32,101 @@ static unsigned long get_symbol_addr(const char *name)
         addr = (unsigned long)kp.addr;
         unregister_kprobe(&kp);
         printk(KERN_INFO "[Filter] ✅ %s = 0x%lx\n", name, addr);
+    } else {
+        printk(KERN_WARNING "[Filter] ❌ %s NOT FOUND (err=%d)\n", name, ret);
     }
     
     return addr;
 }
 
-/* ---------- 检查是否为 maps 文件 ---------- */
-static int is_maps_file(struct file *file)
+/* ---------- 检查当前进程是否是 DuckDetector ---------- */
+static int is_target_process(void)
 {
-    struct dentry *dentry;
-    const char *name;
+    struct task_struct *task;
+    const char *comm;
     
-    if (!file) return 0;
-    dentry = file->f_path.dentry;
-    if (!dentry) return 0;
-    name = dentry->d_name.name;
-    if (!name) return 0;
+    task = current;
+    if (!task) return 0;
     
-    if (strcmp(name, "maps") == 0 ||
-        strcmp(name, "smaps") == 0 ||
-        strstr(name, "maps") == name) {
+    comm = task->comm;
+    
+    if (strstr(comm, "duckdetector") ||
+        strstr(comm, "eltavine") ||
+        strstr(comm, "DefaultDispatch") ||
+        strstr(comm, "DuckDetector")) {
         return 1;
     }
     return 0;
 }
 
-/* ---------- 过滤 maps 内容 ---------- */
-static void filter_maps_lines(struct seq_file *m)
+/* ---------- show_map pre_handler：直接跳过 ---------- */
+static int show_map_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
-    char *buf, *src, *dst, *line_start, *line_end;
-    unsigned long count, src_pos, dst_pos, remaining, line_len;
-    int hidden_count;
+    struct seq_file *m;
+    unsigned long addr_start, addr_end;
+    char *line;
     
-    if (!m || !m->buf || m->count == 0) return;
+    (void)p;
     
-    hidden_count = 0;
-    buf = m->buf;
-    count = m->count;
-    src = buf;
-    dst = buf;
-    src_pos = 0;
-    dst_pos = 0;
-    
-    while (src_pos < count) {
-        remaining = count - src_pos;
-        line_end = memchr(src + src_pos, '\n', remaining);
-        
-        if (!line_end) {
-            line_start = src + src_pos;
-            line_len = remaining;
-            
-            /* 直接匹配 "r-xp 00000000" */
-            if (strstr(line_start, "r-xp 00000000") == NULL) {
-                if (dst_pos != src_pos) {
-                    memmove(dst + dst_pos, line_start, line_len);
-                }
-                dst_pos += line_len;
-            } else {
-                hidden_count++;
-            }
-            src_pos = count;
-            break;
-        }
-        
-        line_start = src + src_pos;
-        line_len = (unsigned long)(line_end - line_start) + 1;
-        
-        /* 直接匹配 "r-xp 00000000" */
-        if (strstr(line_start, "r-xp 00000000") == NULL) {
-            if (dst_pos != src_pos) {
-                memmove(dst + dst_pos, line_start, line_len);
-            }
-            dst_pos += line_len;
-        } else {
-            hidden_count++;
-        }
-        src_pos += line_len;
+    if (!is_target_process()) {
+        return 0;
     }
     
-    if (hidden_count > 0) {
-        printk(KERN_INFO "[Filter] 🧹 Filtered %d lines\n", hidden_count);
+#if defined(CONFIG_ARM64)
+    m = (struct seq_file *)regs->regs[0];
+#elif defined(CONFIG_X86_64)
+    m = (struct seq_file *)regs->di;
+#else
+    m = NULL;
+#endif
+    
+    if (!m || !m->buf) {
+        return 0;
     }
     
-    m->count = dst_pos;
-    if (m->count < m->size) {
-        m->buf[m->count] = '\0';
-    }
+    /* 检查刚写入的内容是否包含 "r-xp 00000000" */
+    /* 在 show_map 执行后，通过 post_handler 清空 */
+    
+    return 0;
 }
 
-/* ---------- seq_read post_handler ---------- */
-static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
+/* ---------- show_map post_handler：过滤当前行 ---------- */
+static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
                                   unsigned long flags)
 {
-    struct file *file;
     struct seq_file *m;
-    ssize_t ret;
+    unsigned long old_count;
+    char *line_start;
+    unsigned long line_len;
     
     (void)p;
     (void)flags;
     
-#if defined(CONFIG_ARM64)
-    file = (struct file *)regs->regs[0];
-    ret = (ssize_t)regs->regs[0];
-#elif defined(CONFIG_X86_64)
-    file = (struct file *)regs->di;
-    ret = (ssize_t)regs->ax;
-#else
-    file = NULL;
-    ret = 0;
-#endif
-    
-    if (!file || ret <= 0 || !is_maps_file(file)) {
+    if (!is_target_process()) {
         return;
     }
     
-    m = (struct seq_file *)file->private_data;
-    if (!m) return;
+#if defined(CONFIG_ARM64)
+    m = (struct seq_file *)regs->regs[0];
+#elif defined(CONFIG_X86_64)
+    m = (struct seq_file *)regs->di;
+#else
+    m = NULL;
+#endif
     
-    filter_maps_lines(m);
+    if (!m || !m->buf || m->count == 0) {
+        return;
+    }
+    
+    /* 找到刚刚写入的行（从上次位置到当前 count） */
+    /* 由于 show_map 每行调用一次，直接检查整个缓冲区 */
+    if (strstr(m->buf, "r-xp 00000000")) {
+        /* 清空整个缓冲区 */
+        m->count = 0;
+        m->buf[0] = '\0';
+        printk(KERN_INFO "[Filter] 🧹 Filtered r-xp 00000000 for PID=%d\n",
+               current->pid);
+    }
 }
 
 /* ---------- 模块初始化 ---------- */
@@ -158,28 +135,32 @@ static int __init filter_init(void)
     int ret;
     
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] Filter: r-xp 00000000\n");
+    printk(KERN_INFO "[Filter] show_map filter\n");
+    printk(KERN_INFO "Target: DuckDetector\n");
     printk(KERN_INFO "========================================\n");
     
-    g_seq_read_addr = get_symbol_addr("seq_read");
-    if (!g_seq_read_addr) {
-        g_seq_read_addr = get_symbol_addr("proc_reg_read");
+    g_show_map_addr = get_symbol_addr("show_map");
+    if (!g_show_map_addr) {
+        g_show_map_addr = get_symbol_addr("show_map_vma");
+    }
+    if (!g_show_map_addr) {
+        g_show_map_addr = get_symbol_addr("proc_pid_maps_show");
     }
     
-    if (!g_seq_read_addr) {
-        printk(KERN_ERR "[Filter] ❌ seq_read not found!\n");
+    if (!g_show_map_addr) {
+        printk(KERN_ERR "[Filter] ❌ show_map not found!\n");
         return -ENOENT;
     }
     
-    memset(&kp_seq_read, 0, sizeof(struct kprobe));
-    kp_seq_read.addr = (void *)g_seq_read_addr;
-    kp_seq_read.post_handler = seq_read_post_handler;
+    memset(&kp_show_map, 0, sizeof(struct kprobe));
+    kp_show_map.addr = (void *)g_show_map_addr;
+    kp_show_map.post_handler = show_map_post_handler;
     
-    ret = register_kprobe(&kp_seq_read);
+    ret = register_kprobe(&kp_show_map);
     if (ret == 0) {
         printk(KERN_INFO "[Filter] ✅ Hook registered!\n");
         printk(KERN_INFO "========================================\n");
-        printk(KERN_INFO "[Filter] 🧹 r-xp 00000000 lines hidden\n");
+        printk(KERN_INFO "[Filter] 🧹 r-xp 00000000 hidden for DuckDetector\n");
         printk(KERN_INFO "========================================\n");
         return 0;
     }
@@ -191,7 +172,7 @@ static int __init filter_init(void)
 /* ---------- 模块退出 ---------- */
 static void __exit filter_exit(void)
 {
-    unregister_kprobe(&kp_seq_read);
+    unregister_kprobe(&kp_show_map);
     printk(KERN_INFO "[Filter] Unloaded\n");
 }
 
