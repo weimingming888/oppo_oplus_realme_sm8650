@@ -8,12 +8,12 @@ MODULE_LICENSE("GPL");
 
 static struct kprobe kp;
 
-static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
+/* pre_handler: 返回 1 表示跳过原函数 */
+static int pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
     
     (void)p;
-    (void)flags;
     
 #if defined(CONFIG_ARM64)
     m = (struct seq_file *)regs->regs[0];
@@ -23,14 +23,17 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
     m = NULL;
 #endif
     
-    if (!m || !m->buf || m->count == 0)
-        return;
+    if (!m)
+        return 0;
     
-    /* 直接清空 buffer，返回空 */
+    /* 清空 buffer */
     m->count = 0;
-    if (m->size > 0) {
-        m->buf[0] = '\0';
+    if (m->buf && m->size > 0) {
+        memset(m->buf, 0, m->size);
     }
+    
+    /* 返回 1 跳过原函数，直接返回用户空间 */
+    return 1;
 }
 
 static int __init init(void)
@@ -49,12 +52,12 @@ static int __init init(void)
     for (i = 0; symbols[i] != NULL; i++) {
         memset(&kp, 0, sizeof(struct kprobe));
         kp.symbol_name = symbols[i];
-        kp.post_handler = handler_post;
+        kp.pre_handler = pre_handler;
         
         ret = register_kprobe(&kp);
         if (ret == 0) {
             printk(KERN_INFO "[MAPS] ✅ Hooked: %s\n", symbols[i]);
-            printk(KERN_INFO "[MAPS] Hiding ALL maps content (return empty)\n");
+            printk(KERN_INFO "[MAPS] Skipping original function, returning empty\n");
             return 0;
         }
     }
