@@ -8,13 +8,14 @@
 #include <linux/string.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Multi Hook Filter");
-MODULE_DESCRIPTION("Filter r-xp 00000000 via multiple hooks");
+MODULE_AUTHOR("Enhanced Filter");
+MODULE_DESCRIPTION("Filter r-xp/rwxp 00000000 + libart.so anomalies");
 
 static struct kprobe kp_show_map;
 static struct kprobe kp_seq_read;
 static unsigned long g_show_map_addr;
 static unsigned long g_seq_read_addr;
+static int libart_count = 0;
 
 /* ---------- 通过 kprobe 获取符号地址 ---------- */
 static unsigned long get_symbol_addr(const char *name)
@@ -44,19 +45,69 @@ static int should_hide_line(const char *line, unsigned long len)
 {
     (void)len;
     
-    if (strstr(line, "r-xp 00000000") == NULL) {
-        return 0;
+    /* ============================================================
+     * 规则1: 隐藏 r-xp 00000000 和 rwxp 00000000 匿名映射
+     * ============================================================ */
+    if (strstr(line, "00000000") != NULL) {
+        /* 检查是否有 r-xp 或 rwxp 权限 */
+        if (strstr(line, "r-xp") != NULL || strstr(line, "rwxp") != NULL) {
+            
+            /* 保留 [vdso] */
+            if (strstr(line, "[vdso]") != NULL) {
+                return 0;
+            }
+            
+            /* 保留有文件路径的 */
+            if (strstr(line, "/") != NULL) {
+                return 0;
+            }
+            
+            /* 隐藏所有匿名可执行/可写可执行 */
+            return 1;
+        }
     }
     
+    /* ============================================================
+     * 规则2: 隐藏 libart.so 的异常段
+     * ============================================================ */
+    if (strstr(line, "libart.so") != NULL) {
+        /* 隐藏所有 libart.so 行（最彻底） */
+        return 1;
+    }
+    
+    /* ============================================================
+     * 规则3: 隐藏 r-xp 段中偏移量异常的（如 00400000 等）
+     *        如果偏移量不是 00000000 但属于 libart.so，规则2已经处理
+     * ============================================================ */
+    
+    return 0;
+}
+
+/* ---------- 检查行是否应该被保留（给 seq_read 用） ---------- */
+static int should_keep_line(const char *line, unsigned long len)
+{
+    (void)len;
+    
+    /* 保留 vdso */
     if (strstr(line, "[vdso]") != NULL) {
-        return 0;
+        return 1;
     }
     
-    if (strstr(line, "/") != NULL) {
-        return 0;
+    /* 隐藏所有 00000000 的匿名映射 */
+    if (strstr(line, "00000000") != NULL) {
+        if (strstr(line, "r-xp") != NULL || strstr(line, "rwxp") != NULL) {
+            if (strstr(line, "/") == NULL) {
+                return 0;  /* 隐藏 */
+            }
+        }
     }
     
-    return 1;
+    /* 隐藏所有 libart.so */
+    if (strstr(line, "libart.so") != NULL) {
+        return 0;  /* 隐藏 */
+    }
+    
+    return 1;  /* 保留 */
 }
 
 /* ---------- 过滤 maps ---------- */
@@ -83,7 +134,7 @@ static void filter_maps_lines(struct seq_file *m)
             line_start = src + src_pos;
             line_len = remaining;
             
-            if (!should_hide_line(line_start, line_len)) {
+            if (should_keep_line(line_start, line_len)) {
                 if (dst_pos != src_pos) {
                     memmove(dst + dst_pos, line_start, line_len);
                 }
@@ -98,7 +149,7 @@ static void filter_maps_lines(struct seq_file *m)
         line_start = src + src_pos;
         line_len = (unsigned long)(line_end - line_start) + 1;
         
-        if (!should_hide_line(line_start, line_len)) {
+        if (should_keep_line(line_start, line_len)) {
             if (dst_pos != src_pos) {
                 memmove(dst + dst_pos, line_start, line_len);
             }
@@ -187,8 +238,10 @@ static int __init filter_init(void)
     int hooks = 0;
     
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] MULTI HOOK filter\n");
-    printk(KERN_INFO "[Filter] Hooking: show_map + seq_read\n");
+    printk(KERN_INFO "[Filter] ENHANCED FILTER\n");
+    printk(KERN_INFO "[Filter] Rules:\n");
+    printk(KERN_INFO "  1. r-xp/rwxp 00000000 [anonymous]\n");
+    printk(KERN_INFO "  2. ALL /apex/.../libart.so\n");
     printk(KERN_INFO "========================================\n");
     
     g_show_map_addr = get_symbol_addr("show_map");
@@ -233,7 +286,8 @@ static int __init filter_init(void)
     
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "[Filter] ✅ %d hook(s) registered\n", hooks);
-    printk(KERN_INFO "[Filter] ✅ r-xp 00000000 hidden (ALL paths)\n");
+    printk(KERN_INFO "[Filter] ✅ r-xp/rwxp 00000000 hidden\n");
+    printk(KERN_INFO "[Filter] ✅ libart.so hidden\n");
     printk(KERN_INFO "========================================\n");
     return 0;
 }
