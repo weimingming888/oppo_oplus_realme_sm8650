@@ -13,10 +13,8 @@ MODULE_DESCRIPTION("Filter r-xp 00000000 via multiple hooks");
 
 static struct kprobe kp_show_map;
 static struct kprobe kp_seq_read;
-static struct kprobe kp_proc_reg_read;
 static unsigned long g_show_map_addr;
 static unsigned long g_seq_read_addr;
-static unsigned long g_proc_reg_read_addr;
 
 /* ---------- 通过 kprobe 获取符号地址 ---------- */
 static unsigned long get_symbol_addr(const char *name)
@@ -150,6 +148,7 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     struct file *file;
     struct seq_file *m;
     ssize_t ret;
+    const char *name;
     
     (void)p;
     (void)flags;
@@ -167,13 +166,11 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     
     if (!file || ret <= 0) return;
     
-    /* 检查是否是 maps 文件 */
-    if (file->f_path.dentry && file->f_path.dentry->d_name.name) {
-        const char *name = file->f_path.dentry->d_name.name;
-        if (strcmp(name, "maps") != 0 && strcmp(name, "smaps") != 0) {
-            return;
-        }
-    } else {
+    if (!file->f_path.dentry) return;
+    name = file->f_path.dentry->d_name.name;
+    if (!name) return;
+    
+    if (strcmp(name, "maps") != 0 && strcmp(name, "smaps") != 0) {
         return;
     }
     
@@ -194,7 +191,6 @@ static int __init filter_init(void)
     printk(KERN_INFO "[Filter] Hooking: show_map + seq_read\n");
     printk(KERN_INFO "========================================\n");
     
-    /* 1. show_map */
     g_show_map_addr = get_symbol_addr("show_map");
     if (!g_show_map_addr) {
         g_show_map_addr = get_symbol_addr("show_map_vma");
@@ -214,7 +210,6 @@ static int __init filter_init(void)
         }
     }
     
-    /* 2. seq_read */
     g_seq_read_addr = get_symbol_addr("seq_read");
     if (!g_seq_read_addr) {
         g_seq_read_addr = get_symbol_addr("proc_reg_read");
@@ -248,7 +243,6 @@ static void __exit filter_exit(void)
 {
     unregister_kprobe(&kp_show_map);
     unregister_kprobe(&kp_seq_read);
-    unregister_kprobe(&kp_proc_reg_read);
     printk(KERN_INFO "[Filter] Unloaded\n");
 }
 
