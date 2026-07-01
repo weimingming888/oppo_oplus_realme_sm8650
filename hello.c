@@ -39,7 +39,17 @@ static int pre_show_map_vma(struct kprobe *kp, struct pt_regs *regs)
     is_anon = (!vma->vm_file);
     is_private = (!(vma->vm_flags & VM_SHARED));
 
-    /* 规则1：所有匿名私有 rwxp 直接隐藏，不设尺寸阈值 */
+    /* ====== 规则0: 保护 vdso（最高优先级） ====== */
+    if (vma->vm_file) {
+        char *path_ptr = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
+        if (!IS_ERR(path_ptr) && strstr(path_ptr, "[vdso]")) {
+            printk(KERN_DEBUG "[Filter] ✅ KEEP: vdso\n");
+            ret = 0;
+            goto out;
+        }
+    }
+
+    /* ====== 规则1: 所有匿名私有 rwxp 直接隐藏 ====== */
     if (is_anon && is_private &&
         (vma->vm_flags & VM_READ) &&
         (vma->vm_flags & VM_WRITE) &&
@@ -51,7 +61,7 @@ static int pre_show_map_vma(struct kprobe *kp, struct pt_regs *regs)
         goto out;
     }
 
-    /* 规则2：隐藏 frida / inject.so 映射 */
+    /* ====== 规则2: 隐藏 frida / inject.so 映射 ====== */
     if (vma->vm_file)
     {
         char *path_ptr = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
@@ -67,12 +77,12 @@ static int pre_show_map_vma(struct kprobe *kp, struct pt_regs *regs)
         }
     }
 
-    /* 规则3：无写权限的大块匿名r-xp(>64KB)隐藏，放过vdso小段 */
+    /* ====== 规则3: 隐藏大块匿名 r-xp (>64KB) ====== */
     if (is_anon && is_private &&
         (vma->vm_flags & VM_EXEC) &&
         !(vma->vm_flags & VM_WRITE))
     {
-        if (vma_size > 0x10000)
+        if (vma_size > 0x10000)  /* > 64KB */
         {
             printk(KERN_INFO "[Filter] ❌ HIDE rx anon big size=0x%lx flags=0x%lx\n",
                    vma_size, vma->vm_flags);
@@ -93,7 +103,9 @@ out:
 static int filter_init(void)
 {
     int ret;
-    kp_show_map_vma.kp_symbol_name = "show_map_vma";
+    
+    memset(&kp_show_map_vma, 0, sizeof(struct kprobe));
+    kp_show_map_vma.symbol_name = "show_map_vma";  // ✅ 修正字段名
     kp_show_map_vma.pre_handler = pre_show_map_vma;
 
     ret = register_kprobe(&kp_show_map_vma);
