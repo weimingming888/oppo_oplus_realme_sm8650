@@ -22,6 +22,10 @@ static void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long f
     int len;
     int i;
     int has_text;
+    int modify;
+    char new_perms[5];
+    char *perm_pos;
+    int spaces;
     
     (void)p;
     (void)flags;
@@ -64,8 +68,8 @@ static void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long f
             line[len-1] = '\0';
         
         /* 检查是否应该修改权限 */
-        int modify = 0;
-        char new_perms[5] = "----";
+        modify = 0;
+        strcpy(new_perms, "----");
         
         /* 条件1: 匿名映射 (00:00 0) */
         if (strstr(line, "00:00 0")) {
@@ -98,8 +102,8 @@ static void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long f
         /* 如果需要修改权限 */
         if (modify) {
             /* 在原行中查找权限位置并替换 */
-            char *perm_pos = line_start;
-            int spaces = 0;
+            perm_pos = line_start;
+            spaces = 0;
             
             /* 跳过地址段，找到权限字段 */
             while (perm_pos < line_start + line_len && *perm_pos != ' ')
