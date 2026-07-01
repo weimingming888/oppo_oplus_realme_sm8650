@@ -16,10 +16,10 @@ static void post_show_map_vma(struct kprobe *kp, struct pt_regs *regs,
 {
     struct seq_file *m = NULL;
     char *buf;
-    unsigned long count;
-    char line[512];
     char *line_start, *line_end;
-    unsigned long pos;
+    unsigned long count, pos;
+    char line[512];
+    int len;
     
     (void)kp;
     (void)flags;
@@ -51,9 +51,12 @@ static void post_show_map_vma(struct kprobe *kp, struct pt_regs *regs,
         line_start = buf + pos;
         pos = (unsigned long)(line_end - buf) + 1;
         
+        /* 计算行长度 */
+        len = (int)(pos - (unsigned long)(line_start - buf));
+        if (len > 511) 
+            len = 511;
+            
         /* 复制一行到本地缓冲区 */
-        int len = (pos - (unsigned long)(line_start - buf));
-        if (len > 511) len = 511;
         memcpy(line, line_start, len);
         line[len] = '\0';
         
