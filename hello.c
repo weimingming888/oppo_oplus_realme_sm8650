@@ -31,6 +31,32 @@ static unsigned long get_symbol_addr(const char *name)
     return addr;
 }
 
+/* ---------- 检查是否是纯 r-xp 00000000（后面没有字符） ---------- */
+static int is_pure_anonymous(const char *line)
+{
+    const char *p;
+    
+    /* 查找 r-xp 00000000 */
+    p = strstr(line, "r-xp 00000000");
+    if (p == NULL) {
+        return 0;
+    }
+    
+    /* 检查后面是否还有非空字符 */
+    p += 14; /* 跳过 "r-xp 00000000" */
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    
+    /* 如果后面是换行或结束，就是纯匿名 */
+    if (*p == '\n' || *p == '\r' || *p == '\0') {
+        return 1;
+    }
+    
+    /* 如果后面有 [vdso] 或其他字符，放行 */
+    return 0;
+}
+
 /* ---------- show_map post_handler ---------- */
 static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
@@ -55,10 +81,6 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
 #endif
     
     if (!m || !m->buf || m->count == 0) return;
-    
-    printk(KERN_INFO "[Filter] ========== MAPS DUMP START ==========\n");
-    printk(KERN_INFO "[Filter] PID=%d (%s), count=%lu\n", 
-           current->pid, current->comm, m->count);
     
     buf = m->buf;
     count = m->count;
@@ -93,11 +115,10 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
                 break;
             }
             
-            /* 隐藏 r-xp 00000000 或 rwxp */
-            if (strstr(line_start, "r-xp 00000000") != NULL ||
-                strstr(line_start, "rwxp") != NULL) {
+            /* 只有纯 r-xp 00000000（后面没有字符）才隐藏 */
+            if (is_pure_anonymous(line_start)) {
                 hidden++;
-                printk(KERN_INFO "[Filter] ❌ HIDE (anonymous executable)\n");
+                printk(KERN_INFO "[Filter] ❌ HIDE (pure anonymous)\n");
             } else {
                 printk(KERN_INFO "[Filter] ✅ KEEP\n");
                 if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
@@ -128,11 +149,10 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
             continue;
         }
         
-        /* 隐藏 r-xp 00000000 或 rwxp */
-        if (strstr(line_start, "r-xp 00000000") != NULL ||
-            strstr(line_start, "rwxp") != NULL) {
+        /* 只有纯 r-xp 00000000（后面没有字符）才隐藏 */
+        if (is_pure_anonymous(line_start)) {
             hidden++;
-            printk(KERN_INFO "[Filter] ❌ HIDE (anonymous executable)\n");
+            printk(KERN_INFO "[Filter] ❌ HIDE (pure anonymous)\n");
         } else {
             printk(KERN_INFO "[Filter] ✅ KEEP\n");
             if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
@@ -154,8 +174,9 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
 static int __init filter_init(void)
 {
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] Filter: r-xp 00000000 + rwxp\n");
-    printk(KERN_INFO "[Filter] vdso preserved\n");
+    printk(KERN_INFO "[Filter] Pure anonymous filter\n");
+    printk(KERN_INFO "[Filter] r-xp 00000000 with no trailing chars -> HIDE\n");
+    printk(KERN_INFO "[Filter] r-xp 00000000 with [vdso] -> KEEP\n");
     printk(KERN_INFO "========================================\n");
     
     g_show_map_addr = get_symbol_addr("show_map");
@@ -177,8 +198,8 @@ static int __init filter_init(void)
     
     if (register_kprobe(&kp_show_map) == 0) {
         printk(KERN_INFO "[Filter] ✅ Hook registered\n");
-        printk(KERN_INFO "[Filter] ✅ r-xp 00000000 + rwxp filtered\n");
-        printk(KERN_INFO "[Filter] ✅ [vdso] preserved\n");
+        printk(KERN_INFO "[Filter] ✅ Pure r-xp 00000000 hidden\n");
+        printk(KERN_INFO "[Filter] ✅ r-xp 00000000 [vdso] preserved\n");
         return 0;
     }
     
