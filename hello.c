@@ -8,11 +8,17 @@ MODULE_LICENSE("GPL");
 
 static struct kprobe kp;
 
-static int pre_handler(struct kprobe *p, struct pt_regs *regs)
+static void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
     struct seq_file *m;
+    char *buf;
+    unsigned long count;
+    char line[256];
+    char *line_start, *line_end;
+    int len;
     
     (void)p;
+    (void)flags;
     
 #if defined(CONFIG_ARM64)
     m = (struct seq_file *)regs->regs[0];
@@ -22,17 +28,46 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
     m = NULL;
 #endif
     
-    if (!m)
-        return 0;
+    if (!m || !m->buf || m->count == 0)
+        return;
     
-    /* 清空 buffer */
-    m->count = 0;
-    if (m->buf && m->size > 0) {
-        memset(m->buf, 0, m->size);
+    buf = m->buf;
+    count = m->count;
+    
+    /* ====== 打印 buffer 内容 ====== */
+    printk(KERN_INFO "[MAPS] ========================================\n");
+    printk(KERN_INFO "[MAPS] Buffer size: %lu bytes\n", count);
+    printk(KERN_INFO "[MAPS] PID: %d (%s)\n", current->pid, current->comm);
+    printk(KERN_INFO "[MAPS] ========================================\n");
+    
+    /* 逐行打印 */
+    unsigned long pos = 0;
+    int line_num = 0;
+    
+    while (pos < count) {
+        line_end = memchr(buf + pos, '\n', count - pos);
+        if (!line_end)
+            break;
+        
+        line_start = buf + pos;
+        pos = (unsigned long)(line_end - buf) + 1;
+        
+        len = (int)(pos - (unsigned long)(line_start - buf));
+        if (len > 255)
+            len = 255;
+        
+        memcpy(line, line_start, len);
+        line[len] = '\0';
+        if (len > 0 && line[len-1] == '\n')
+            line[len-1] = '\0';
+        
+        line_num++;
+        printk(KERN_INFO "[MAPS] %d: %s\n", line_num, line);
     }
     
-    /* 返回 0 继续执行原函数（让它刷新数据） */
-    return 0;
+    printk(KERN_INFO "[MAPS] ========================================\n");
+    printk(KERN_INFO "[MAPS] Total lines: %d\n", line_num);
+    printk(KERN_INFO "[MAPS] ========================================\n");
 }
 
 static int __init init(void)
@@ -51,12 +86,12 @@ static int __init init(void)
     for (i = 0; symbols[i] != NULL; i++) {
         memset(&kp, 0, sizeof(struct kprobe));
         kp.symbol_name = symbols[i];
-        kp.pre_handler = pre_handler;
+        kp.post_handler = post_handler;
         
         ret = register_kprobe(&kp);
         if (ret == 0) {
             printk(KERN_INFO "[MAPS] ✅ Hooked: %s\n", symbols[i]);
-            printk(KERN_INFO "[MAPS] Clearing buffer, then executing original function\n");
+            printk(KERN_INFO "[MAPS] Printing buffer content\n");
             return 0;
         }
     }
