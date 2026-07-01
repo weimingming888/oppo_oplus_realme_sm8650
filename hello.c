@@ -3,6 +3,7 @@
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
 #include <linux/sched.h>
+#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
 
@@ -12,7 +13,7 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
 {
     struct seq_file *m;
     char *line_start, *line_end;
-    char line[256];
+    char line[512];
     int len;
     
     (void)p;
@@ -29,19 +30,28 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
     if (!m || !m->buf || m->count == 0)
         return;
     
-    /* 只取第一行（maps 格式） */
+    /* 只取第一行 */
     line_end = memchr(m->buf, '\n', m->count);
     if (!line_end)
         return;
     
     len = (int)(line_end - m->buf);
-    if (len > 255)
-        len = 255;
+    if (len > 511)
+        len = 511;
     
     memcpy(line, m->buf, len);
     line[len] = '\0';
     
-    printk(KERN_INFO "[MAPS] %s\n", line);
+    /* 检查是否为匿名映射（地址范围后面没有文件路径） */
+    /* 匿名映射特征：偏移量为 00000000，设备为 00:00，inode 为 0 */
+    char *p_anon = strstr(line, "00:00 0");
+    
+    if (p_anon) {
+        /* 检查权限：r-xp 或 rwxp */
+        if (strstr(line, "r-xp") || strstr(line, "rwxp")) {
+            printk(KERN_INFO "[MAPS] %s\n", line);
+        }
+    }
 }
 
 static int __init init(void)
@@ -61,11 +71,12 @@ static int __init init(void)
         ret = register_kprobe(&kp);
     }
     if (ret < 0) {
-        printk(KERN_ERR "[MAPS] register failed\n");
+        printk(KERN_ERR "[MAPS] Failed to register kprobe\n");
         return ret;
     }
     
-    printk(KERN_INFO "[MAPS] Loaded\n");
+    printk(KERN_INFO "[MAPS] Loaded, hook at %p\n", kp.addr);
+    printk(KERN_INFO "[MAPS] Filter: anonymous r-xp and rwxp only\n");
     return 0;
 }
 
