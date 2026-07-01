@@ -15,7 +15,6 @@ static struct kprobe kp_show_map;
 static struct kprobe kp_seq_read;
 static unsigned long g_show_map_addr;
 static unsigned long g_seq_read_addr;
-static int libart_count = 0;
 
 /* ---------- 通过 kprobe 获取符号地址 ---------- */
 static unsigned long get_symbol_addr(const char *name)
@@ -40,50 +39,7 @@ static unsigned long get_symbol_addr(const char *name)
     return addr;
 }
 
-/* ---------- 检查是否应该隐藏 ---------- */
-static int should_hide_line(const char *line, unsigned long len)
-{
-    (void)len;
-    
-    /* ============================================================
-     * 规则1: 隐藏 r-xp 00000000 和 rwxp 00000000 匿名映射
-     * ============================================================ */
-    if (strstr(line, "00000000") != NULL) {
-        /* 检查是否有 r-xp 或 rwxp 权限 */
-        if (strstr(line, "r-xp") != NULL || strstr(line, "rwxp") != NULL) {
-            
-            /* 保留 [vdso] */
-            if (strstr(line, "[vdso]") != NULL) {
-                return 0;
-            }
-            
-            /* 保留有文件路径的 */
-            if (strstr(line, "/") != NULL) {
-                return 0;
-            }
-            
-            /* 隐藏所有匿名可执行/可写可执行 */
-            return 1;
-        }
-    }
-    
-    /* ============================================================
-     * 规则2: 隐藏 libart.so 的异常段
-     * ============================================================ */
-    if (strstr(line, "libart.so") != NULL) {
-        /* 隐藏所有 libart.so 行（最彻底） */
-        return 1;
-    }
-    
-    /* ============================================================
-     * 规则3: 隐藏 r-xp 段中偏移量异常的（如 00400000 等）
-     *        如果偏移量不是 00000000 但属于 libart.so，规则2已经处理
-     * ============================================================ */
-    
-    return 0;
-}
-
-/* ---------- 检查行是否应该被保留（给 seq_read 用） ---------- */
+/* ---------- 检查行是否应该被保留 ---------- */
 static int should_keep_line(const char *line, unsigned long len)
 {
     (void)len;
@@ -93,21 +49,24 @@ static int should_keep_line(const char *line, unsigned long len)
         return 1;
     }
     
-    /* 隐藏所有 00000000 的匿名映射 */
+    /* 规则1: 隐藏所有 libart.so */
+    if (strstr(line, "libart.so") != NULL) {
+        return 0;
+    }
+    
+    /* 规则2: 隐藏 r-xp/rwxp 00000000 匿名映射 */
     if (strstr(line, "00000000") != NULL) {
         if (strstr(line, "r-xp") != NULL || strstr(line, "rwxp") != NULL) {
-            if (strstr(line, "/") == NULL) {
-                return 0;  /* 隐藏 */
+            /* 有文件路径的保留 */
+            if (strstr(line, "/") != NULL) {
+                return 1;
             }
+            /* 无文件路径的隐藏（匿名映射） */
+            return 0;
         }
     }
     
-    /* 隐藏所有 libart.so */
-    if (strstr(line, "libart.so") != NULL) {
-        return 0;  /* 隐藏 */
-    }
-    
-    return 1;  /* 保留 */
+    return 1;
 }
 
 /* ---------- 过滤 maps ---------- */
