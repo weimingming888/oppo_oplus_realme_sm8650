@@ -15,7 +15,20 @@ jobs:
           sudo apt update
           sudo apt install -y binutils python-is-python3 libssl-dev libelf-dev
 
-      - name: 下载源码与工具链
+      - name: 恢复缓存 (内核源码 + 工具链)
+        id: cache-restore
+        uses: actions/cache@v3
+        with:
+          path: |
+            kernel_workspace/common
+            kernel_workspace/clang20
+            kernel_workspace/build-tools
+          key: kernel-workspace-${{ hashFiles('kernel_workspace/common/.config') }}
+          restore-keys: |
+            kernel-workspace-
+
+      - name: 下载源码与工具链 (仅在缓存未命中时)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
         run: |
           mkdir -p kernel_workspace
           cd kernel_workspace
@@ -35,11 +48,22 @@ jobs:
         run: |
           echo "PATH=$(pwd)/kernel_workspace/clang20/bin:$(pwd)/kernel_workspace/build-tools/bin:$PATH" >> $GITHUB_ENV
 
-      - name: 生成配置与头文件
+      - name: 生成配置与头文件 (仅在缓存未命中时)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
         run: |
           cd kernel_workspace/common
           make -j$(nproc) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang LD=ld.lld O=out gki_defconfig
           make -j$(nproc) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang LD=ld.lld O=out modules_prepare
+
+      - name: 保存缓存 (仅在下载时)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          path: |
+            kernel_workspace/common
+            kernel_workspace/clang20
+            kernel_workspace/build-tools
+          key: kernel-workspace-${{ hashFiles('kernel_workspace/common/.config') }}
 
       - name: 编译 hello.ko 并放入根目录
         run: |
@@ -48,7 +72,6 @@ jobs:
           cp $GITHUB_WORKSPACE/hello.c drivers/hello/
           echo "obj-m += hello.o" > drivers/hello/Makefile
 
-          # 编译模块，添加 CFLAGS 关闭未使用变量警告
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld \
