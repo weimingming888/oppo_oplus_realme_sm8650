@@ -1,77 +1,72 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
-#include <linux/path.h>
-#include <linux/dcache.h>
+#include <linux/seq_file.h>
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/string.h>
-#include <linux/preempt.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
 
 static struct kprobe kp_show_map_vma;
 
-static int pre_show_map_vma(struct kprobe *kp, struct pt_regs *regs)
+/* ====== 在 post_handler 中处理 ====== */
+static void post_show_map_vma(struct kprobe *kp, struct pt_regs *regs, 
+                               unsigned long flags)
 {
-    struct vm_area_struct *vma = NULL;
-    char *buf = NULL;
-    char *fname = NULL;
-    unsigned long size;
-    char perm[5] = "----";
-    int ret = 0;
-
+    struct seq_file *m = NULL;
+    char *buf;
+    unsigned long count;
+    char line[512];
+    char *line_start, *line_end;
+    unsigned long pos;
+    
+    (void)kp;
+    (void)flags;
+    
+    /* 获取 seq_file 指针 (ARM64 x0 是第一个参数) */
 #if defined(CONFIG_ARM64)
-    vma = (struct vm_area_struct *)regs->regs[0];
+    m = (struct seq_file *)regs->regs[0];
 #elif defined(CONFIG_X86_64)
-    vma = (struct vm_area_struct *)regs->di;
+    m = (struct seq_file *)regs->di;
 #elif defined(CONFIG_ARM)
-    vma = (struct vm_area_struct *)regs->ARM_r0;
+    m = (struct seq_file *)regs->ARM_r0;
 #else
-    vma = NULL;
+    m = NULL;
 #endif
-
-    if (!vma)
-        return 0;
-
-    size = vma->vm_end - vma->vm_start;
-
-    /* 构建权限字符串 */
-    if (vma->vm_flags & VM_READ) perm[0] = 'r';
-    if (vma->vm_flags & VM_WRITE) perm[1] = 'w';
-    if (vma->vm_flags & VM_EXEC) perm[2] = 'x';
-    perm[3] = (vma->vm_flags & VM_SHARED) ? 's' : 'p';
-    perm[4] = '\0';
-
-    /* ====== 安全检查：只有在非原子上下文才能调用 d_path ====== */
-    if (in_atomic() || irqs_disabled() || preemptible() == 0) {
-        /* 原子上下文，只打印基本信息，不获取路径 */
-        printk(KERN_INFO "[MAP_DBG] %016lx-%016lx %s size=0x%lx (atomic, skip path)\n",
-               vma->vm_start, vma->vm_end, perm, size);
-        return 0;
+    
+    if (!m || !m->buf || m->count == 0)
+        return;
+    
+    buf = m->buf;
+    count = m->count;
+    pos = 0;
+    
+    /* 只打印第一行作为样本（避免 log 爆炸） */
+    while (pos < count) {
+        line_end = memchr(buf + pos, '\n', count - pos);
+        if (!line_end)
+            break;
+            
+        line_start = buf + pos;
+        pos = (unsigned long)(line_end - buf) + 1;
+        
+        /* 复制一行到本地缓冲区 */
+        int len = (pos - (unsigned long)(line_start - buf));
+        if (len > 511) len = 511;
+        memcpy(line, line_start, len);
+        line[len] = '\0';
+        
+        /* 去掉换行符 */
+        if (len > 0 && line[len-1] == '\n')
+            line[len-1] = '\0';
+        
+        printk(KERN_INFO "[MAP_DBG] %s\n", line);
+        break;  /* 只打印第一行 */
     }
-
-    /* ====== 安全获取路径 ====== */
-    buf = kmalloc(PATH_MAX, GFP_KERNEL);  /* 这里可以用 GFP_KERNEL，因为不在原子上下文 */
-    if (!buf) {
-        printk(KERN_INFO "[MAP_DBG] %016lx-%016lx %s size=0x%lx (no mem)\n",
-               vma->vm_start, vma->vm_end, perm, size);
-        return 0;
-    }
-
-    if (vma->vm_file) {
-        char *path_ptr = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
-        if (!IS_ERR(path_ptr)) {
-            fname = path_ptr;
-        }
-    }
-
-    printk(KERN_INFO "[MAP_DBG] %016lx-%016lx %s size=0x%lx %s\n",
-           vma->vm_start, vma->vm_end, perm, size,
-           fname ? fname : "anon");
-
-    kfree(buf);
-    return 0;
 }
 
+/* ====== 模块初始化 ====== */
 static int mapdbg_init(void)
 {
     int ret;
@@ -84,15 +79,20 @@ static int mapdbg_init(void)
     };
     int i;
 
+    printk(KERN_INFO "[MAP_DBG] ========================================\n");
+    printk(KERN_INFO "[MAP_DBG] Loading VMA Debug Module\n");
+    printk(KERN_INFO "[MAP_DBG] ========================================\n");
+
     memset(&kp_show_map_vma, 0, sizeof(struct kprobe));
-    kp_show_map_vma.symbol_name = "show_map_vma";  /* 先尝试这个 */
-    kp_show_map_vma.pre_handler = pre_show_map_vma;
+    kp_show_map_vma.post_handler = post_show_map_vma;
 
     for (i = 0; symbols[i] != NULL; i++) {
         kp_show_map_vma.symbol_name = symbols[i];
         ret = register_kprobe(&kp_show_map_vma);
         if (ret == 0) {
-            printk(KERN_INFO "[MAP_DBG] ✅ Hooked: %s\n", symbols[i]);
+            printk(KERN_INFO "[MAP_DBG] ✅ Hooked: %s at %p\n", 
+                   symbols[i], kp_show_map_vma.addr);
+            printk(KERN_INFO "[MAP_DBG] ✅ Module ready\n");
             return 0;
         }
     }
@@ -101,13 +101,14 @@ static int mapdbg_init(void)
     return -ENOENT;
 }
 
+/* ====== 模块退出 ====== */
 static void mapdbg_exit(void)
 {
     unregister_kprobe(&kp_show_map_vma);
-    printk(KERN_INFO "[MAP_DBG] Unloaded\n");
+    printk(KERN_INFO "[MAP_DBG] Module unloaded\n");
 }
 
 module_init(mapdbg_init);
 module_exit(mapdbg_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Debug print all VMA info with path (safe version)");
+MODULE_DESCRIPTION("Debug print /proc/pid/maps content (safe version)");
