@@ -8,7 +8,6 @@ MODULE_LICENSE("GPL");
 
 static struct kprobe kp;
 
-/* pre_handler: 返回 1 表示跳过原函数 */
 static int pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
@@ -32,8 +31,8 @@ static int pre_handler(struct kprobe *p, struct pt_regs *regs)
         memset(m->buf, 0, m->size);
     }
     
-    /* 返回 1 跳过原函数，直接返回用户空间 */
-    return 1;
+    /* 返回 0 继续执行原函数（让它刷新数据） */
+    return 0;
 }
 
 static int __init init(void)
@@ -57,7 +56,7 @@ static int __init init(void)
         ret = register_kprobe(&kp);
         if (ret == 0) {
             printk(KERN_INFO "[MAPS] ✅ Hooked: %s\n", symbols[i]);
-            printk(KERN_INFO "[MAPS] Skipping original function, returning empty\n");
+            printk(KERN_INFO "[MAPS] Clearing buffer, then executing original function\n");
             return 0;
         }
     }
