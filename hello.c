@@ -59,12 +59,10 @@ static int is_target_process(void)
     return 0;
 }
 
-/* ---------- show_map pre_handler：直接跳过 ---------- */
+/* ---------- show_map pre_handler ---------- */
 static int show_map_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct seq_file *m;
-    unsigned long addr_start, addr_end;
-    char *line;
     
     (void)p;
     
@@ -84,20 +82,14 @@ static int show_map_pre_handler(struct kprobe *p, struct pt_regs *regs)
         return 0;
     }
     
-    /* 检查刚写入的内容是否包含 "r-xp 00000000" */
-    /* 在 show_map 执行后，通过 post_handler 清空 */
-    
     return 0;
 }
 
-/* ---------- show_map post_handler：过滤当前行 ---------- */
+/* ---------- show_map post_handler：过滤 ---------- */
 static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
                                   unsigned long flags)
 {
     struct seq_file *m;
-    unsigned long old_count;
-    char *line_start;
-    unsigned long line_len;
     
     (void)p;
     (void)flags;
@@ -118,10 +110,7 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
         return;
     }
     
-    /* 找到刚刚写入的行（从上次位置到当前 count） */
-    /* 由于 show_map 每行调用一次，直接检查整个缓冲区 */
     if (strstr(m->buf, "r-xp 00000000")) {
-        /* 清空整个缓冲区 */
         m->count = 0;
         m->buf[0] = '\0';
         printk(KERN_INFO "[Filter] 🧹 Filtered r-xp 00000000 for PID=%d\n",
@@ -154,6 +143,7 @@ static int __init filter_init(void)
     
     memset(&kp_show_map, 0, sizeof(struct kprobe));
     kp_show_map.addr = (void *)g_show_map_addr;
+    kp_show_map.pre_handler = show_map_pre_handler;
     kp_show_map.post_handler = show_map_post_handler;
     
     ret = register_kprobe(&kp_show_map);
