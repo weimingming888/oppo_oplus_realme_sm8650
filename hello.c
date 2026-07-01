@@ -16,6 +16,8 @@ static void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long f
     char line[256];
     char *line_start, *line_end;
     int len;
+    unsigned long pos;
+    int line_num;
     
     (void)p;
     (void)flags;
@@ -41,8 +43,8 @@ static void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long f
     printk(KERN_INFO "[MAPS] ========================================\n");
     
     /* 逐行打印 */
-    unsigned long pos = 0;
-    int line_num = 0;
+    pos = 0;
+    line_num = 0;
     
     while (pos < count) {
         line_end = memchr(buf + pos, '\n', count - pos);
