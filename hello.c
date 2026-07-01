@@ -6,14 +6,13 @@
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/string.h>
+#include <linux/version.h>
 
 static struct kprobe kp_show_map_vma;
 
 static int pre_show_map_vma(struct kprobe *kp, struct pt_regs *regs)
 {
     struct vm_area_struct *vma = NULL;
-    char *buf = NULL;
-    char *fname = NULL;
     int ret = 0;
     unsigned long vma_size;
     bool is_anon, is_private;
@@ -31,100 +30,71 @@ static int pre_show_map_vma(struct kprobe *kp, struct pt_regs *regs)
     if (!vma)
         return 0;
 
-    buf = kmalloc(PATH_MAX, GFP_ATOMIC);
-    if (!buf)
-        return 0;
-
     vma_size = vma->vm_end - vma->vm_start;
     is_anon = (!vma->vm_file);
     is_private = (!(vma->vm_flags & VM_SHARED));
 
-    /* ====== 规则0: 保护 vdso（最高优先级） ====== */
-    if (vma->vm_file) {
-        char *path_ptr = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
-        if (!IS_ERR(path_ptr) && strstr(path_ptr, "[vdso]")) {
-            printk(KERN_DEBUG "[Filter] ✅ KEEP: vdso\n");
-            ret = 0;
-            goto out;
-        }
-    }
-
-    /* ====== 规则1: 所有匿名私有 rwxp 直接隐藏 ====== */
+    /* ====== 规则1: 匿名私有 rwxp 直接隐藏 ====== */
     if (is_anon && is_private &&
         (vma->vm_flags & VM_READ) &&
         (vma->vm_flags & VM_WRITE) &&
         (vma->vm_flags & VM_EXEC))
     {
-        printk(KERN_INFO "[Filter] ❌ HIDE rwxp anon: 0x%lx-0x%lx size=0x%lx flags=0x%lx\n",
-               vma->vm_start, vma->vm_end, vma_size, vma->vm_flags);
-        ret = 1;
-        goto out;
+        /* 使用 printk_deferred 避免递归 */
+        printk_deferred(KERN_INFO "[Filter] HIDE rwxp anon: 0x%lx\n", vma->vm_start);
+        return 1;
     }
 
-    /* ====== 规则2: 隐藏 frida / inject.so 映射 ====== */
-    if (vma->vm_file)
-    {
-        char *path_ptr = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
-        if (!IS_ERR(path_ptr))
-        {
-            fname = path_ptr;
-            if (strstr(fname, "frida") || strstr(fname, "inject.so"))
-            {
-                printk(KERN_INFO "[Filter] ❌ HIDE lib: %s\n", fname);
-                ret = 1;
-                goto out;
-            }
-        }
-    }
-
-    /* ====== 规则3: 隐藏大块匿名 r-xp (>64KB) ====== */
+    /* ====== 规则2: 隐藏大块匿名 r-xp (>64KB) ====== */
     if (is_anon && is_private &&
         (vma->vm_flags & VM_EXEC) &&
-        !(vma->vm_flags & VM_WRITE))
+        !(vma->vm_flags & VM_WRITE) &&
+        vma_size > 0x10000)
     {
-        if (vma_size > 0x10000)  /* > 64KB */
-        {
-            printk(KERN_INFO "[Filter] ❌ HIDE rx anon big size=0x%lx flags=0x%lx\n",
-                   vma_size, vma->vm_flags);
-            ret = 1;
-        }
-        else
-        {
-            printk(KERN_DEBUG "[Filter] ✅ KEEP small rx anon size=0x%lx flags=0x%lx\n",
-                   vma_size, vma->vm_flags);
-        }
+        printk_deferred(KERN_INFO "[Filter] HIDE rx anon: 0x%lx size=0x%lx\n", 
+                        vma->vm_start, vma_size);
+        return 1;
     }
 
-out:
-    kfree(buf);
-    return ret;
+    return 0;
 }
 
 static int filter_init(void)
 {
     int ret;
+    const char *symbols[] = {
+        "show_map_vma",
+        "seq_show_map_vma",
+        "proc_pid_maps_show",
+        "show_map",
+        NULL
+    };
+    int i;
     
     memset(&kp_show_map_vma, 0, sizeof(struct kprobe));
-    kp_show_map_vma.symbol_name = "show_map_vma";  // ✅ 修正字段名
     kp_show_map_vma.pre_handler = pre_show_map_vma;
-
-    ret = register_kprobe(&kp_show_map_vma);
-    if (ret < 0)
-    {
-        printk(KERN_ERR "[Filter] register kprobe failed, ret=%d\n", ret);
-        return ret;
+    
+    for (i = 0; symbols[i] != NULL; i++) {
+        kp_show_map_vma.symbol_name = symbols[i];
+        ret = register_kprobe(&kp_show_map_vma);
+        if (ret == 0) {
+            printk(KERN_INFO "[Filter] Hooked %s at %p\n", 
+                   symbols[i], kp_show_map_vma.addr);
+            return 0;
+        }
     }
-    printk(KERN_INFO "[Filter] VMA filter loaded, hook show_map_vma\n");
-    return 0;
+    
+    printk(KERN_ERR "[Filter] Failed to register kprobe: %d\n", ret);
+    return -ENOENT;
 }
 
 static void filter_exit(void)
 {
     unregister_kprobe(&kp_show_map_vma);
-    printk(KERN_INFO "[Filter] VMA filter unloaded\n");
+    printk(KERN_INFO "[Filter] Unloaded\n");
 }
 
 module_init(filter_init);
 module_exit(filter_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Hide inject rwxp/frida/big rx anon vma");
+MODULE_DESCRIPTION("Hide rwxp and big rx anon vma");
