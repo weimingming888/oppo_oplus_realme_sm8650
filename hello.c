@@ -16,9 +16,7 @@ MODULE_DESCRIPTION("Debug: find which function reads /proc/maps");
 /* ---------- 全局变量 ---------- */
 static struct kprobe kp_seq_read;
 static struct kprobe kp_proc_reg_read;
-static struct kprobe kp_seq_printf;
 static struct kprobe kp_show_map;
-static struct kprobe kp_maps_open;
 static struct kprobe kp_vfs_read;
 
 static unsigned long g_seq_read_addr;
@@ -56,6 +54,9 @@ static int is_maps_file(struct file *file)
 {
     struct dentry *dentry;
     const char *name;
+    int result;
+    
+    result = 0;
     
     if (!file) {
         return 0;
@@ -74,10 +75,10 @@ static int is_maps_file(struct file *file)
     if (strcmp(name, "maps") == 0 ||
         strcmp(name, "smaps") == 0 ||
         strstr(name, "maps") == name) {
-        return 1;
+        result = 1;
     }
     
-    return 0;
+    return result;
 }
 
 /* ---------- 打印进程信息 ---------- */
@@ -87,14 +88,20 @@ static void log_access(const char *hook_name, struct file *file, ssize_t ret)
     char comm[32];
     const char *filename;
     struct dentry *dentry;
+    int i;
     
     task = current;
     if (!task) {
         return;
     }
     
-    memcpy(comm, task->comm, sizeof(comm) - 1);
-    comm[sizeof(comm) - 1] = '\0';
+    for (i = 0; i < 31 && i < sizeof(task->comm); i++) {
+        comm[i] = task->comm[i];
+        if (comm[i] == '\0') {
+            break;
+        }
+    }
+    comm[31] = '\0';
     
     filename = "unknown";
     if (file && file->f_path.dentry) {
@@ -115,8 +122,8 @@ static void seq_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     struct file *file;
     ssize_t ret;
     
-    p = p;
-    flags = flags;
+    (void)p;
+    (void)flags;
     
 #if defined(CONFIG_ARM64)
     file = (struct file *)regs->regs[0];
@@ -147,8 +154,8 @@ static void proc_reg_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     struct file *file;
     ssize_t ret;
     
-    p = p;
-    flags = flags;
+    (void)p;
+    (void)flags;
     
 #if defined(CONFIG_ARM64)
     file = (struct file *)regs->regs[0];
@@ -179,8 +186,8 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
     struct seq_file *m;
     struct file *file;
     
-    p = p;
-    flags = flags;
+    (void)p;
+    (void)flags;
     
 #if defined(CONFIG_ARM64)
     m = (struct seq_file *)regs->regs[0];
@@ -194,7 +201,7 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
         return;
     }
     
-    file = m->file;
+    file = (struct file *)m->file;
     if (!file) {
         return;
     }
@@ -213,8 +220,8 @@ static void vfs_read_post_handler(struct kprobe *p, struct pt_regs *regs,
     struct file *file;
     ssize_t ret;
     
-    p = p;
-    flags = flags;
+    (void)p;
+    (void)flags;
     
 #if defined(CONFIG_ARM64)
     file = (struct file *)regs->regs[0];
@@ -246,7 +253,6 @@ static int register_all_hooks(void)
     
     registered = 0;
     
-    /* 1. seq_read */
     if (g_seq_read_addr) {
         memset(&kp_seq_read, 0, sizeof(struct kprobe));
         kp_seq_read.addr = (void *)g_seq_read_addr;
@@ -258,7 +264,6 @@ static int register_all_hooks(void)
         }
     }
     
-    /* 2. proc_reg_read */
     if (g_proc_reg_read_addr) {
         memset(&kp_proc_reg_read, 0, sizeof(struct kprobe));
         kp_proc_reg_read.addr = (void *)g_proc_reg_read_addr;
@@ -270,7 +275,6 @@ static int register_all_hooks(void)
         }
     }
     
-    /* 3. show_map（/proc/pid/maps 的 show 函数） */
     if (g_show_map_addr) {
         memset(&kp_show_map, 0, sizeof(struct kprobe));
         kp_show_map.addr = (void *)g_show_map_addr;
@@ -282,7 +286,6 @@ static int register_all_hooks(void)
         }
     }
     
-    /* 4. vfs_read（最底层的文件读取） */
     if (g_vfs_read_addr) {
         memset(&kp_vfs_read, 0, sizeof(struct kprobe));
         kp_vfs_read.addr = (void *)g_vfs_read_addr;
@@ -306,19 +309,18 @@ static int __init debug_init(void)
     printk(KERN_INFO "[DEBUG] Finding all possible read functions\n");
     printk(KERN_INFO "========================================\n");
     
-    /* 获取所有符号 */
     g_seq_read_addr = get_symbol_addr("seq_read");
     g_proc_reg_read_addr = get_symbol_addr("proc_reg_read");
     g_show_map_addr = get_symbol_addr("show_map");
-    g_vfs_read_addr = get_symbol_addr("vfs_read");
     
-    /* 如果 show_map 没找到，尝试其他名称 */
     if (!g_show_map_addr) {
         g_show_map_addr = get_symbol_addr("show_map_vma");
     }
     if (!g_show_map_addr) {
         g_show_map_addr = get_symbol_addr("proc_pid_maps_show");
     }
+    
+    g_vfs_read_addr = get_symbol_addr("vfs_read");
     
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "[DEBUG] Registering hooks...\n");
