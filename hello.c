@@ -16,9 +16,10 @@ static unsigned long g_show_map_addr;
 static unsigned long get_symbol_addr(const char *name)
 {
     struct kprobe kp;
-    unsigned long addr = 0;
+    unsigned long addr;
     int ret;
     
+    addr = 0;
     memset(&kp, 0, sizeof(struct kprobe));
     kp.symbol_name = name;
     
@@ -34,42 +35,25 @@ static unsigned long get_symbol_addr(const char *name)
 /* ---------- 检查是否应该隐藏 ---------- */
 static int should_hide(const char *line)
 {
-    const char *p;
-    int hide;
-    
-    hide = 0;
-    
     /* 规则1: 任何包含 rwxp 的行都隐藏 */
     if (strstr(line, "rwxp") != NULL) {
         return 1;
     }
     
-    /* 规则2: r-xp 00000000 行，后面有字符才放行 */
+    /* 规则2: 包含 r-xp 00000000 的行 */
     if (strstr(line, "r-xp 00000000") != NULL) {
-        /* 有 [vdso] 的保留 */
+        /* 如果有 [vdso]，保留 */
         if (strstr(line, "[vdso]") != NULL) {
             return 0;
         }
-        /* 有文件路径的保留 */
+        /* 如果有文件路径，保留 */
         if (strstr(line, "/") != NULL) {
             return 0;
         }
-        /* 检查后面是否还有非空字符（除了空格） */
-        p = strstr(line, "r-xp 00000000");
-        if (p != NULL) {
-            p += 14; /* 跳过 "r-xp 00000000" */
-            while (*p == ' ' || *p == '\t') {
-                p++;
-            }
-            /* 如果后面还有非空字符（如 00:00 0），隐藏 */
-            if (*p != '\n' && *p != '\r' && *p != '\0') {
-                return 1;  /* 隐藏 */
-            }
-        }
-        return 1;  /* 纯的也隐藏 */
+        /* 其他所有 r-xp 00000000 都隐藏（包括 00:00 0） */
+        return 1;
     }
     
-    /* 其他全部放行 */
     return 0;
 }
 
@@ -77,10 +61,18 @@ static int should_hide(const char *line)
 static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
     struct seq_file *m;
-    char *buf, *src, *dst, *line_start, *line_end;
-    unsigned long count, src_pos, dst_pos, remaining, line_len;
-    int hidden = 0;
-    int line_num = 0;
+    char *buf;
+    char *src;
+    char *dst;
+    char *line_start;
+    char *line_end;
+    unsigned long count;
+    unsigned long src_pos;
+    unsigned long dst_pos;
+    unsigned long remaining;
+    unsigned long line_len;
+    int hidden;
+    int line_num;
     char line_copy[256];
     int copy_len;
     int i;
@@ -96,14 +88,22 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
     m = NULL;
 #endif
     
-    if (!m || !m->buf || m->count == 0) return;
+    if (!m || !m->buf || m->count == 0) {
+        return;
+    }
     
+    hidden = 0;
+    line_num = 0;
     buf = m->buf;
     count = m->count;
     src = buf;
     dst = buf;
     src_pos = 0;
     dst_pos = 0;
+    
+    printk(KERN_INFO "[Filter] ========== MAPS DUMP START ==========\n");
+    printk(KERN_INFO "[Filter] PID=%d (%s), count=%lu\n",
+           current->pid, current->comm, m->count);
     
     while (src_pos < count) {
         remaining = count - src_pos;
@@ -114,7 +114,7 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
             line_len = remaining;
             line_num++;
             
-            copy_len = (line_len < 255) ? line_len : 255;
+            copy_len = (line_len < 255) ? (int)line_len : 255;
             for (i = 0; i < copy_len; i++) {
                 line_copy[i] = line_start[i];
             }
@@ -127,7 +127,9 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
                 printk(KERN_INFO "[Filter] ❌ HIDE\n");
             } else {
                 printk(KERN_INFO "[Filter] ✅ KEEP\n");
-                if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
+                if (dst_pos != src_pos) {
+                    memmove(dst + dst_pos, line_start, line_len);
+                }
                 dst_pos += line_len;
             }
             src_pos = count;
@@ -138,7 +140,7 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
         line_len = (unsigned long)(line_end - line_start) + 1;
         line_num++;
         
-        copy_len = (line_len < 255) ? line_len : 255;
+        copy_len = (line_len < 255) ? (int)line_len : 255;
         for (i = 0; i < copy_len; i++) {
             line_copy[i] = line_start[i];
         }
@@ -151,7 +153,9 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
             printk(KERN_INFO "[Filter] ❌ HIDE\n");
         } else {
             printk(KERN_INFO "[Filter] ✅ KEEP\n");
-            if (dst_pos != src_pos) memmove(dst + dst_pos, line_start, line_len);
+            if (dst_pos != src_pos) {
+                memmove(dst + dst_pos, line_start, line_len);
+            }
             dst_pos += line_len;
         }
         src_pos += line_len;
