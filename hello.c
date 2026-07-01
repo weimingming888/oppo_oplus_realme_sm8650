@@ -42,7 +42,10 @@ static int should_hide_line(const char *line, unsigned long len)
     int result = 0;
     (void)len;
     
-    /* 隐藏 r-xp 00000000 或 rwxp 00000000 的匿名映射 */
+    /* ============================================================
+     * 规则1: 隐藏 r-xp/rwxp 00000000 匿名映射 (LSPosed 注入)
+     *       特征: 偏移量是 00000000，没有文件路径
+     * ============================================================ */
     if ((strstr(line, "r-xp 00000000") != NULL || 
          strstr(line, "rwxp 00000000") != NULL) &&
         strstr(line, "/") == NULL &&
@@ -50,10 +53,12 @@ static int should_hide_line(const char *line, unsigned long len)
         result = 1;
     }
     
-    /* 隐藏所有 libart.so */
-    if (strstr(line, "libart.so") != NULL) {
-        result = 1;
-    }
+    /* ============================================================
+     * 规则2: 不隐藏 libart.so！（重要！）
+     *        之前隐藏 libart.so 导致 App 闪退
+     *        LSPosed 的匿名映射已经通过规则1隐藏了
+     * ============================================================ */
+    /* 不隐藏 libart.so */
     
     return result;
 }
@@ -132,7 +137,6 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsign
     (void)p;
     (void)flags;
     
-    /* show_map 的函数签名: int show_map(struct seq_file *m, void *v) */
 #if defined(CONFIG_ARM64)
     m = (struct seq_file *)regs->regs[0];
 #elif defined(CONFIG_X86_64)
@@ -183,7 +187,7 @@ static int __init filter_init(void)
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "[Filter] ✅ %d hook(s) registered\n", hook_count);
     printk(KERN_INFO "[Filter] ✅ r-xp/rwxp 00000000 [anonymous] -> HIDE\n");
-    printk(KERN_INFO "[Filter] ✅ libart.so -> HIDE\n");
+    printk(KERN_INFO "[Filter] ✅ libart.so -> KEPT (no longer hidden)\n");
     printk(KERN_INFO "========================================\n");
     return 0;
 }
