@@ -15,9 +15,8 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
     char *line_start, *line_end;
     char line[512];
     int len;
-    char *p_anon;
-    int has_text = 0;
     int i;
+    int has_text = 0;
     
     (void)p;
     (void)flags;
@@ -45,30 +44,29 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
     memcpy(line, m->buf, len);
     line[len] = '\0';
     
-    /* 检查是否为匿名映射：偏移量为 00000000，设备为 00:00，inode 为 0 */
-    p_anon = strstr(line, "00:00 0");
-    if (!p_anon)
+    /* 检查是否为匿名映射 */
+    if (!strstr(line, "00:00 0"))
         return;
     
     /* 检查权限：r-xp 或 rwxp */
     if (!strstr(line, "r-xp") && !strstr(line, "rwxp"))
         return;
     
-    /* 检查行末尾是否有文字（非空格非制表符） */
+    /* 从末尾开始，跳过空格和制表符，检查是否有实际文字 */
     for (i = strlen(line) - 1; i >= 0; i--) {
         if (line[i] == ' ' || line[i] == '\t')
             continue;
         if (line[i] != '\0') {
-            has_text = 1;  /* 末尾有文字 */
+            has_text = 1;  /* 有非空字符 */
             break;
         }
     }
     
-    /* 如果末尾有文字，放行（不打印） */
+    /* 如果有文字（包括 [vdso]、[anon]、文件路径等），放行 */
     if (has_text)
         return;
     
-    /* 匿名 r-xp 或 rwxp，过滤掉并打印 */
+    /* 纯匿名 r-xp/rwxp（末尾没有文字），过滤掉 */
     printk(KERN_INFO "[FILTERED] %s\n", line);
 }
 
@@ -94,7 +92,7 @@ static int __init init(void)
     }
     
     printk(KERN_INFO "[MAPS] Loaded, hook at %p\n", kp.addr);
-    printk(KERN_INFO "[MAPS] Rule: Filter anonymous r-xp/rwxp with no trailing text\n");
+    printk(KERN_INFO "[MAPS] Filter: pure anonymous r-xp/rwxp (no trailing text)\n");
     return 0;
 }
 
