@@ -9,6 +9,9 @@
 #include <linux/file.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
+#include <linux/version.h>
+#include <linux/cred.h>
+#include <linux/uidgid.h>
 
 MODULE_LICENSE("GPL");
 
@@ -19,44 +22,43 @@ static unsigned long g_show_map_addr;
 static struct file *log_file = NULL;
 static DEFINE_MUTEX(log_mutex);
 
-/* 在内核中打开文件 */
-static struct file *open_log_file(const char *path, int flags)
-{
-    struct file *filp;
-    mm_segment_t old_fs;
-    
-    old_fs = get_fs();
-    set_fs(KERNEL_DS);
-    
-    filp = filp_open(path, flags, 0644);
-    
-    set_fs(old_fs);
-    return filp;
-}
-
-/* 向文件写入内容 */
+/* 向文件写入内容 - 内核 6.1 兼容版本 */
 static void write_to_log(const char *buf, size_t len)
 {
     loff_t pos;
-    mm_segment_t old_fs;
+    int ret;
     
     if (!log_file || !buf || len == 0)
         return;
     
     mutex_lock(&log_mutex);
     
-    old_fs = get_fs();
-    set_fs(KERNEL_DS);
-    
     /* 移动到文件末尾 */
     pos = vfs_llseek(log_file, 0, SEEK_END);
     if (pos >= 0) {
-        vfs_write(log_file, buf, len, &pos);
+        /* 内核 6.1 使用 kernel_write，需要传递 loff_t 指针 */
+        ret = kernel_write(log_file, buf, len, &pos);
+        if (ret < 0) {
+            printk(KERN_ERR "[Filter] Failed to write log: %d\n", ret);
+        }
     }
     
-    set_fs(old_fs);
-    
     mutex_unlock(&log_mutex);
+}
+
+/* 在内核中打开文件 */
+static struct file *open_log_file(const char *path, int flags)
+{
+    struct file *filp;
+    
+    /* 内核 6.1 直接使用 filp_open，无需 set_fs */
+    filp = filp_open(path, flags, 0644);
+    if (IS_ERR(filp)) {
+        printk(KERN_ERR "[Filter] filp_open failed: %ld\n", PTR_ERR(filp));
+        return NULL;
+    }
+    
+    return filp;
 }
 
 /* 关闭日志文件 */
@@ -74,7 +76,6 @@ static void write_maps_content(struct seq_file *m)
     char *buf;
     unsigned long count;
     char header[256];
-    int ret;
     
     if (!m || !m->buf || m->count == 0)
         return;
@@ -88,12 +89,12 @@ static void write_maps_content(struct seq_file *m)
     
     /* 复制数据 */
     memcpy(buf, m->buf, m->count);
-    buf[m->count] = '\0';  /* 确保字符串终止 */
+    buf[m->count] = '\0';
     
     /* 写入标题头 */
     snprintf(header, sizeof(header), 
-             "\n========== MAPS DUMP: PID=%d (%s) ==========\n",
-             current->pid, current->comm);
+             "\n========== MAPS DUMP: PID=%d (%s) Time=%lu ==========\n",
+             current->pid, current->comm, jiffies);
     write_to_log(header, strlen(header));
     
     /* 写入完整内容 */
@@ -108,6 +109,49 @@ static void write_maps_content(struct seq_file *m)
     kfree(buf);
 }
 
+/* ---------- 精确检查是否为 rwxp 权限 ---------- */
+static int is_rwxp_permission(const char *line_start, unsigned long line_len)
+{
+    const char *p = line_start;
+    
+    /* 跳过地址段和权限字段之前的空格 */
+    /* 格式: start-end perm offset major:minor inode pathname */
+    
+    /* 跳过开头的空格 */
+    while (p - line_start < line_len && *p == ' ') p++;
+    
+    /* 跳过第一个地址 (start) */
+    while (p - line_start < line_len && *p != ' ') p++;
+    while (p - line_start < line_len && *p == ' ') p++;
+    
+    /* 跳过第二个地址 (end) */
+    while (p - line_start < line_len && *p != ' ') p++;
+    while (p - line_start < line_len && *p == ' ') p++;
+    
+    /* 现在 p 指向权限字段 (如 rwxp, r-xp, r--p 等) */
+    if (p - line_start + 4 <= line_len) {
+        return (p[0] == 'r' && p[1] == 'w' && p[2] == 'x' && p[3] == 'p');
+    }
+    return 0;
+}
+
+/* ---------- 复制一行内容到临时缓冲区 ---------- */
+static void copy_line_to_buffer(const char *src, char *dst, size_t len)
+{
+    size_t copy_len = (len < 255) ? len : 255;
+    size_t i;
+    
+    for (i = 0; i < copy_len; i++) {
+        dst[i] = src[i];
+    }
+    dst[copy_len] = '\0';
+    
+    /* 移除换行符以便打印 */
+    if (copy_len > 0 && dst[copy_len - 1] == '\n') {
+        dst[copy_len - 1] = '\0';
+    }
+}
+
 /* ---------- show_map post_handler ---------- */
 static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, 
                                    unsigned long flags)
@@ -118,16 +162,17 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
     int hidden = 0;
     int line_num = 0;
     char line_copy[256];
-    int copy_len;
-    int i;
     
     (void)p;
     (void)flags;
     
+    /* 获取 seq_file 指针 */
 #if defined(CONFIG_ARM64)
     m = (struct seq_file *)regs->regs[0];
 #elif defined(CONFIG_X86_64)
     m = (struct seq_file *)regs->di;
+#elif defined(CONFIG_ARM)
+    m = (struct seq_file *)regs->ARM_r0;
 #else
     m = NULL;
 #endif
@@ -154,92 +199,16 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
         line_end = memchr(src + src_pos, '\n', remaining);
         
         if (!line_end) {
+            /* 处理最后一行（没有换行符） */
             line_start = src + src_pos;
             line_len = remaining;
             line_num++;
             
-            copy_len = (line_len < 255) ? line_len : 255;
-            for (i = 0; i < copy_len; i++) {
-                line_copy[i] = line_start[i];
-            }
-            line_copy[copy_len] = '\0';
-            
+            copy_line_to_buffer(line_start, line_copy, line_len);
             printk(KERN_INFO "[Filter] LINE %d: %s\n", line_num, line_copy);
             
-            /* 精确匹配权限字段 */
-            if (line_len >= 4) {
-                char perm[5] = {0};
-                /* 跳过地址段，获取权限字段 */
-                const char *p = line_start;
-                int skip = 0;
-                
-                /* 跳过第一个地址段（到空格） */
-                while (p - line_start < line_len && *p != ' ') p++;
-                while (p - line_start < line_len && *p == ' ') p++;
-                /* 跳过第二个地址段（到空格） */
-                while (p - line_start < line_len && *p != ' ') p++;
-                while (p - line_start < line_len && *p == ' ') p++;
-                /* 现在 p 指向权限字段 */
-                if (p - line_start + 4 <= line_len) {
-                    perm[0] = p[0];
-                    perm[1] = p[1];
-                    perm[2] = p[2];
-                    perm[3] = p[3];
-                    perm[4] = '\0';
-                }
-                
-                if (strcmp(perm, "rwxp") == 0) {
-                    hidden++;
-                    printk(KERN_INFO "[Filter] ❌ HIDE (rwxp)\n");
-                } else {
-                    printk(KERN_INFO "[Filter] ✅ KEEP\n");
-                    if (dst_pos != src_pos) 
-                        memmove(dst + dst_pos, line_start, line_len);
-                    dst_pos += line_len;
-                }
-            } else {
-                /* 行太短，直接保留 */
-                if (dst_pos != src_pos) 
-                    memmove(dst + dst_pos, line_start, line_len);
-                dst_pos += line_len;
-            }
-            src_pos = count;
-            break;
-        }
-        
-        line_start = src + src_pos;
-        line_len = (unsigned long)(line_end - line_start) + 1;
-        line_num++;
-        
-        copy_len = (line_len < 255) ? line_len : 255;
-        for (i = 0; i < copy_len; i++) {
-            line_copy[i] = line_start[i];
-        }
-        line_copy[copy_len] = '\0';
-        
-        printk(KERN_INFO "[Filter] LINE %d: %s\n", line_num, line_copy);
-        
-        /* 精确匹配权限字段 */
-        if (line_len >= 4) {
-            char perm[5] = {0};
-            const char *p = line_start;
-            int skip = 0;
-            
-            /* 跳过地址段，获取权限字段 */
-            while (p - line_start < line_len && *p != ' ') p++;
-            while (p - line_start < line_len && *p == ' ') p++;
-            while (p - line_start < line_len && *p != ' ') p++;
-            while (p - line_start < line_len && *p == ' ') p++;
-            
-            if (p - line_start + 4 <= line_len) {
-                perm[0] = p[0];
-                perm[1] = p[1];
-                perm[2] = p[2];
-                perm[3] = p[3];
-                perm[4] = '\0';
-            }
-            
-            if (strcmp(perm, "rwxp") == 0) {
+            /* 检查是否为 rwxp */
+            if (is_rwxp_permission(line_start, line_len)) {
                 hidden++;
                 printk(KERN_INFO "[Filter] ❌ HIDE (rwxp)\n");
             } else {
@@ -248,8 +217,24 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
                     memmove(dst + dst_pos, line_start, line_len);
                 dst_pos += line_len;
             }
+            src_pos = count;
+            break;
+        }
+        
+        /* 处理完整的行（包含换行符） */
+        line_start = src + src_pos;
+        line_len = (unsigned long)(line_end - line_start) + 1;  /* 包含换行符 */
+        line_num++;
+        
+        copy_line_to_buffer(line_start, line_copy, line_len);
+        printk(KERN_INFO "[Filter] LINE %d: %s\n", line_num, line_copy);
+        
+        /* 检查是否为 rwxp */
+        if (is_rwxp_permission(line_start, line_len)) {
+            hidden++;
+            printk(KERN_INFO "[Filter] ❌ HIDE (rwxp)\n");
         } else {
-            /* 行太短，直接保留 */
+            printk(KERN_INFO "[Filter] ✅ KEEP\n");
             if (dst_pos != src_pos) 
                 memmove(dst + dst_pos, line_start, line_len);
             dst_pos += line_len;
@@ -260,6 +245,7 @@ static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs,
     printk(KERN_INFO "[Filter] Total lines: %d, Hidden: %d\n", line_num, hidden);
     printk(KERN_INFO "[Filter] ========== MAPS DUMP END ==========\n");
     
+    /* 更新 seq_file 的 count */
     m->count = dst_pos;
     if (m->count < m->size) {
         m->buf[m->count] = '\0';
@@ -281,6 +267,8 @@ static unsigned long get_symbol_addr(const char *name)
         addr = (unsigned long)kp.addr;
         unregister_kprobe(&kp);
         printk(KERN_INFO "[Filter] ✅ %s = 0x%lx\n", name, addr);
+    } else {
+        printk(KERN_INFO "[Filter] ❌ %s not found (err=%d)\n", name, ret);
     }
     return addr;
 }
@@ -291,28 +279,35 @@ static int __init filter_init(void)
     const char *log_path = "/sdcard/test.txt";
     
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] DEBUG: rwxp filter with file logging\n");
+    printk(KERN_INFO "[Filter] rwxp filter with file logging\n");
+    printk(KERN_INFO "[Filter] Kernel version: %d.%d.%d\n",
+           LINUX_VERSION_CODE >> 16,
+           (LINUX_VERSION_CODE >> 8) & 0xFF,
+           LINUX_VERSION_CODE & 0xFF);
     printk(KERN_INFO "========================================\n");
     
     /* 打开日志文件（如果不存在则创建） */
     log_file = open_log_file(log_path, O_CREAT | O_WRONLY | O_APPEND);
-    if (!log_file || IS_ERR(log_file)) {
-        printk(KERN_ERR "[Filter] ❌ Failed to open %s (err=%ld)\n", 
-               log_path, PTR_ERR(log_file));
-        log_file = NULL;
+    if (!log_file) {
+        printk(KERN_ERR "[Filter] ❌ Failed to open %s\n", log_path);
         /* 继续执行，不因为文件打开失败而终止 */
     } else {
         printk(KERN_INFO "[Filter] ✅ Log file opened: %s\n", log_path);
         /* 写入启动标记 */
         write_to_log("\n=== FILTER MODULE LOADED ===\n", 28);
+        write_to_log("=== Kernel 6.1 compatible ===\n", 30);
     }
     
+    /* 尝试多个可能的符号名 */
     g_show_map_addr = get_symbol_addr("show_map");
     if (!g_show_map_addr) {
         g_show_map_addr = get_symbol_addr("show_map_vma");
     }
     if (!g_show_map_addr) {
         g_show_map_addr = get_symbol_addr("proc_pid_maps_show");
+    }
+    if (!g_show_map_addr) {
+        g_show_map_addr = get_symbol_addr("seq_show_map");
     }
     
     if (!g_show_map_addr) {
@@ -326,11 +321,12 @@ static int __init filter_init(void)
     kp_show_map.post_handler = show_map_post_handler;
     
     if (register_kprobe(&kp_show_map) == 0) {
-        printk(KERN_INFO "[Filter] ✅ Hook registered\n");
+        printk(KERN_INFO "[Filter] ✅ Hook registered at 0x%lx\n", g_show_map_addr);
         printk(KERN_INFO "[Filter] Open any app to see maps dump\n");
         return 0;
     }
     
+    printk(KERN_ERR "[Filter] ❌ Failed to register kprobe\n");
     close_log_file();
     return -EINVAL;
 }
