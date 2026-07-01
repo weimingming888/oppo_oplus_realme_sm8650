@@ -12,9 +12,6 @@ MODULE_LICENSE("GPL");
 static struct kprobe kp_show_map;
 static unsigned long g_show_map_addr;
 
-static int hook_count = 0;
-static int filter_count = 0;
-
 /* ---------- 获取符号地址 ---------- */
 static unsigned long get_symbol_addr(const char *name)
 {
@@ -30,52 +27,30 @@ static unsigned long get_symbol_addr(const char *name)
         addr = (unsigned long)kp.addr;
         unregister_kprobe(&kp);
         printk(KERN_INFO "[Filter] ✅ %s = 0x%lx\n", name, addr);
-    } else {
-        printk(KERN_WARNING "[Filter] ❌ %s NOT FOUND (err=%d)\n", name, ret);
     }
     return addr;
 }
 
-/* ---------- 检查是否应该隐藏 ---------- */
-static int should_hide_line(const char *line, unsigned long len)
+/* ---------- show_map post_handler ---------- */
+static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
-    int result = 0;
-    (void)len;
-    
-    /* ============================================================
-     * 规则1: 隐藏 r-xp/rwxp 00000000 匿名映射 (LSPosed 注入)
-     *       特征: 偏移量是 00000000，没有文件路径
-     * ============================================================ */
-    if ((strstr(line, "r-xp 00000000") != NULL || 
-         strstr(line, "rwxp 00000000") != NULL) &&
-        strstr(line, "/") == NULL &&
-        strstr(line, "[vdso]") == NULL) {
-        result = 1;
-    }
-    
-    /* ============================================================
-     * 规则2: 不隐藏 libart.so！（重要！）
-     *        之前隐藏 libart.so 导致 App 闪退
-     *        LSPosed 的匿名映射已经通过规则1隐藏了
-     * ============================================================ */
-    /* 不隐藏 libart.so */
-    
-    return result;
-}
-
-/* ---------- 过滤 maps ---------- */
-static void filter_maps_lines(struct seq_file *m)
-{
+    struct seq_file *m;
     char *buf, *src, *dst, *line_start, *line_end;
     unsigned long count, src_pos, dst_pos, remaining, line_len;
     int hidden = 0;
     
-    if (!m || !m->buf || m->count == 0) return;
+    (void)p;
+    (void)flags;
     
-    filter_count++;
-    if (filter_count % 10 == 0) {
-        printk(KERN_INFO "[Filter] filter called %d times\n", filter_count);
-    }
+#if defined(CONFIG_ARM64)
+    m = (struct seq_file *)regs->regs[0];
+#elif defined(CONFIG_X86_64)
+    m = (struct seq_file *)regs->di;
+#else
+    m = NULL;
+#endif
+    
+    if (!m || !m->buf || m->count == 0) return;
     
     buf = m->buf;
     count = m->count;
@@ -92,7 +67,8 @@ static void filter_maps_lines(struct seq_file *m)
             line_start = src + src_pos;
             line_len = remaining;
             
-            if (!should_hide_line(line_start, line_len)) {
+            /* 只要包含 rwxp 就过滤 */
+            if (strstr(line_start, "rwxp") == NULL) {
                 if (dst_pos != src_pos) {
                     memmove(dst + dst_pos, line_start, line_len);
                 }
@@ -107,7 +83,8 @@ static void filter_maps_lines(struct seq_file *m)
         line_start = src + src_pos;
         line_len = (unsigned long)(line_end - line_start) + 1;
         
-        if (!should_hide_line(line_start, line_len)) {
+        /* 只要包含 rwxp 就过滤 */
+        if (strstr(line_start, "rwxp") == NULL) {
             if (dst_pos != src_pos) {
                 memmove(dst + dst_pos, line_start, line_len);
             }
@@ -119,8 +96,8 @@ static void filter_maps_lines(struct seq_file *m)
     }
     
     if (hidden > 0) {
-        printk(KERN_INFO "[Filter] 🧹 Hidden %d lines for PID=%d (%s)\n",
-               hidden, current->pid, current->comm);
+        printk(KERN_INFO "[Filter] 🧹 Filtered %d rwxp lines for PID=%d\n",
+               hidden, current->pid);
     }
     
     m->count = dst_pos;
@@ -129,35 +106,11 @@ static void filter_maps_lines(struct seq_file *m)
     }
 }
 
-/* ---------- show_map post_handler ---------- */
-static void show_map_post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
-{
-    struct seq_file *m;
-    
-    (void)p;
-    (void)flags;
-    
-#if defined(CONFIG_ARM64)
-    m = (struct seq_file *)regs->regs[0];
-#elif defined(CONFIG_X86_64)
-    m = (struct seq_file *)regs->di;
-#else
-    m = NULL;
-#endif
-    
-    if (m) {
-        filter_maps_lines(m);
-    }
-}
-
 /* ---------- 模块初始化 ---------- */
 static int __init filter_init(void)
 {
-    int ret;
-    
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] ENHANCED FILTER\n");
-    printk(KERN_INFO "[Filter] Hooking show_map only\n");
+    printk(KERN_INFO "[Filter] Filter: any line containing rwxp\n");
     printk(KERN_INFO "========================================\n");
     
     g_show_map_addr = get_symbol_addr("show_map");
@@ -168,35 +121,29 @@ static int __init filter_init(void)
         g_show_map_addr = get_symbol_addr("proc_pid_maps_show");
     }
     
-    if (g_show_map_addr) {
-        memset(&kp_show_map, 0, sizeof(struct kprobe));
-        kp_show_map.addr = (void *)g_show_map_addr;
-        kp_show_map.post_handler = show_map_post_handler;
-        ret = register_kprobe(&kp_show_map);
-        if (ret == 0) {
-            hook_count++;
-            printk(KERN_INFO "[Filter] ✅ show_map hook registered\n");
-        }
-    }
-    
-    if (hook_count == 0) {
-        printk(KERN_ERR "[Filter] ❌ No hooks registered!\n");
+    if (!g_show_map_addr) {
+        printk(KERN_ERR "[Filter] ❌ show_map not found!\n");
         return -ENOENT;
     }
     
-    printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[Filter] ✅ %d hook(s) registered\n", hook_count);
-    printk(KERN_INFO "[Filter] ✅ r-xp/rwxp 00000000 [anonymous] -> HIDE\n");
-    printk(KERN_INFO "[Filter] ✅ libart.so -> KEPT (no longer hidden)\n");
-    printk(KERN_INFO "========================================\n");
-    return 0;
+    memset(&kp_show_map, 0, sizeof(struct kprobe));
+    kp_show_map.addr = (void *)g_show_map_addr;
+    kp_show_map.post_handler = show_map_post_handler;
+    
+    if (register_kprobe(&kp_show_map) == 0) {
+        printk(KERN_INFO "[Filter] ✅ Hook registered!\n");
+        printk(KERN_INFO "[Filter] ✅ Filtering: any line with rwxp\n");
+        return 0;
+    }
+    
+    return -EINVAL;
 }
 
 /* ---------- 模块退出 ---------- */
 static void __exit filter_exit(void)
 {
     unregister_kprobe(&kp_show_map);
-    printk(KERN_INFO "[Filter] Unloaded, total filter calls: %d\n", filter_count);
+    printk(KERN_INFO "[Filter] Unloaded\n");
 }
 
 module_init(filter_init);
