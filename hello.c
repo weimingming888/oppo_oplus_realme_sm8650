@@ -3,6 +3,7 @@
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
 #include <linux/sched.h>
+#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
 
@@ -13,11 +14,14 @@ static void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long f
     struct seq_file *m;
     char *buf;
     unsigned long count;
-    char line[256];
     char *line_start, *line_end;
+    unsigned long src_pos, dst_pos;
+    char *src, *dst;
+    unsigned long remaining, line_len;
+    char line[256];
     int len;
-    unsigned long pos;
-    int line_num;
+    int i;
+    int has_text;
     
     (void)p;
     (void)flags;
@@ -35,41 +39,109 @@ static void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long f
     
     buf = m->buf;
     count = m->count;
+    src = buf;
+    dst = buf;
+    src_pos = 0;
+    dst_pos = 0;
     
-    /* ====== 打印 buffer 内容 ====== */
-    printk(KERN_INFO "[MAPS] ========================================\n");
-    printk(KERN_INFO "[MAPS] Buffer size: %lu bytes\n", count);
-    printk(KERN_INFO "[MAPS] PID: %d (%s)\n", current->pid, current->comm);
-    printk(KERN_INFO "[MAPS] ========================================\n");
-    
-    /* 逐行打印 */
-    pos = 0;
-    line_num = 0;
-    
-    while (pos < count) {
-        line_end = memchr(buf + pos, '\n', count - pos);
-        if (!line_end)
-            break;
+    while (src_pos < count) {
+        remaining = count - src_pos;
+        line_end = memchr(src + src_pos, '\n', remaining);
         
-        line_start = buf + pos;
-        pos = (unsigned long)(line_end - buf) + 1;
+        if (!line_end) {
+            line_start = src + src_pos;
+            line_len = remaining;
+        } else {
+            line_start = src + src_pos;
+            line_len = (unsigned long)(line_end - line_start) + 1;
+        }
         
-        len = (int)(pos - (unsigned long)(line_start - buf));
-        if (len > 255)
-            len = 255;
-        
+        /* 复制行用于检查 */
+        len = (line_len < 255) ? line_len : 255;
         memcpy(line, line_start, len);
         line[len] = '\0';
         if (len > 0 && line[len-1] == '\n')
             line[len-1] = '\0';
         
-        line_num++;
-        printk(KERN_INFO "[MAPS] %d: %s\n", line_num, line);
+        /* 检查是否应该修改权限 */
+        int modify = 0;
+        char new_perms[5] = "----";
+        
+        /* 条件1: 匿名映射 (00:00 0) */
+        if (strstr(line, "00:00 0")) {
+            /* 检查末尾是否有文字 */
+            has_text = 0;
+            for (i = strlen(line) - 1; i >= 0; i--) {
+                if (line[i] == ' ' || line[i] == '\t')
+                    continue;
+                if (line[i] != '\0') {
+                    has_text = 1;
+                    break;
+                }
+            }
+            
+            /* 如果是纯匿名（末尾无文字） */
+            if (!has_text) {
+                /* 检查权限：rwxp → r--p */
+                if (strstr(line, "rwxp")) {
+                    modify = 1;
+                    strcpy(new_perms, "r--p");
+                }
+                /* 检查权限：r-xp → r--p */
+                else if (strstr(line, "r-xp")) {
+                    modify = 1;
+                    strcpy(new_perms, "r--p");
+                }
+            }
+        }
+        
+        /* 如果需要修改权限 */
+        if (modify) {
+            /* 在原行中查找权限位置并替换 */
+            char *perm_pos = line_start;
+            int spaces = 0;
+            
+            /* 跳过地址段，找到权限字段 */
+            while (perm_pos < line_start + line_len && *perm_pos != ' ')
+                perm_pos++;
+            while (perm_pos < line_start + line_len && *perm_pos == ' ')
+                perm_pos++;
+            while (perm_pos < line_start + line_len && *perm_pos != ' ')
+                perm_pos++;
+            while (perm_pos < line_start + line_len && *perm_pos == ' ')
+                perm_pos++;
+            while (perm_pos < line_start + line_len && *perm_pos != ' ')
+                perm_pos++;
+            while (perm_pos < line_start + line_len && *perm_pos == ' ')
+                perm_pos++;
+            
+            /* 现在 perm_pos 指向权限字段 */
+            if (perm_pos + 4 <= line_start + line_len) {
+                /* 替换权限为 r--p */
+                perm_pos[0] = 'r';
+                perm_pos[1] = '-';
+                perm_pos[2] = '-';
+                perm_pos[3] = 'p';
+            }
+        }
+        
+        /* 保留该行（修改过或未修改的） */
+        if (dst_pos != src_pos) {
+            memmove(dst + dst_pos, line_start, line_len);
+        }
+        dst_pos += line_len;
+        
+        src_pos += line_len;
+        
+        if (!line_end)
+            break;
     }
     
-    printk(KERN_INFO "[MAPS] ========================================\n");
-    printk(KERN_INFO "[MAPS] Total lines: %d\n", line_num);
-    printk(KERN_INFO "[MAPS] ========================================\n");
+    /* 更新 buffer 大小 */
+    m->count = dst_pos;
+    if (m->count < m->size) {
+        m->buf[m->count] = '\0';
+    }
 }
 
 static int __init init(void)
@@ -93,7 +165,7 @@ static int __init init(void)
         ret = register_kprobe(&kp);
         if (ret == 0) {
             printk(KERN_INFO "[MAPS] ✅ Hooked: %s\n", symbols[i]);
-            printk(KERN_INFO "[MAPS] Printing buffer content\n");
+            printk(KERN_INFO "[MAPS] Replacing: rwxp → r--p, anonymous r-xp → r--p\n");
             return 0;
         }
     }
