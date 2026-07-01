@@ -13,6 +13,7 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
 {
     struct seq_file *m;
     char *line_start, *line_end;
+    char *p_anon;
     char line[512];
     int len;
     
@@ -43,8 +44,7 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long f
     line[len] = '\0';
     
     /* 检查是否为匿名映射（地址范围后面没有文件路径） */
-    /* 匿名映射特征：偏移量为 00000000，设备为 00:00，inode 为 0 */
-    char *p_anon = strstr(line, "00:00 0");
+    p_anon = strstr(line, "00:00 0");
     
     if (p_anon) {
         /* 检查权限：r-xp 或 rwxp */
