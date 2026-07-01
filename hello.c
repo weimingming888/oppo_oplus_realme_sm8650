@@ -130,14 +130,18 @@ static int __init resolver_init(void)
     unsigned long addr;
     int found = 0;
     int not_found = 0;
+    int total = 0;
+    
+    /* 计算符号数量 */
+    for (i = 0; symbols[i] != NULL; i++)
+        total++;
     
     printk(KERN_INFO "\n");
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "Kernel Symbol Resolver via Kprobe\n");
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "\n");
-    printk(KERN_INFO "Resolving %d symbols...\n", 
-           sizeof(symbols) / sizeof(symbols[0]) - 1);
+    printk(KERN_INFO "Resolving %d symbols...\n", total);
     printk(KERN_INFO "\n");
     
     /* 遍历所有符号 */
