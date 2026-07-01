@@ -1,53 +1,63 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/kallsyms.h>
+#include <linux/kprobes.h>
+#include <linux/version.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Symbol Export Tester");
-MODULE_DESCRIPTION("Test if kallsyms_on_each_symbol is exported");
+MODULE_AUTHOR("Kprobe Address Finder");
+MODULE_DESCRIPTION("Get kallsyms_lookup_name address via kprobe");
 
-/* 回调函数：遍历符号时被调用 */
-static int symbol_callback(void *data, const char *symname, 
-                           struct module *mod, unsigned long addr)
+/* ---------- kprobe 结构 ---------- */
+static struct kprobe kp_kallsyms_lookup_name;
+
+/* ---------- 空 handler（不需要做任何事） ---------- */
+static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    /* 只打印前 5 个符号，避免刷屏 */
-    static int count = 0;
-    if (count++ < 5) {
-        printk(KERN_INFO "  Symbol: %s at 0x%lx\n", symname, addr);
-    }
     return 0;
 }
 
 /* ---------- 模块初始化 ---------- */
-static int __init test_init(void)
+static int __init finder_init(void)
 {
     int ret;
-    
+    unsigned long addr;
+
     printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "Testing kallsyms_on_each_symbol\n");
+    printk(KERN_INFO "Getting kallsyms_lookup_name address\n");
+    printk(KERN_INFO "via kprobe\n");
     printk(KERN_INFO "========================================\n");
-    
-    /* 尝试调用 kallsyms_on_each_symbol */
-    ret = kallsyms_on_each_symbol(symbol_callback, NULL);
-    
-    if (ret == 0) {
-        printk(KERN_INFO "✅ SUCCESS! kallsyms_on_each_symbol is EXPORTED\n");
-        printk(KERN_INFO "   The function works and returned 0\n");
-        printk(KERN_INFO "========================================\n");
-        return 0;
-    } else {
-        printk(KERN_INFO "⚠️  kallsyms_on_each_symbol returned: %d\n", ret);
-        printk(KERN_INFO "   (May still be exported but returned error)\n");
-        printk(KERN_INFO "========================================\n");
-        return 0;
+
+    /* 清空 kprobe 结构 */
+    memset(&kp_kallsyms_lookup_name, 0, sizeof(struct kprobe));
+
+    /* 设置要查找的符号名 */
+    kp_kallsyms_lookup_name.symbol_name = "kallsyms_lookup_name";
+    kp_kallsyms_lookup_name.pre_handler = handler_pre;
+
+    /* 注册 kprobe */
+    ret = register_kprobe(&kp_kallsyms_lookup_name);
+    if (ret < 0) {
+        printk(KERN_ERR "❌ Failed to register kprobe: %d\n", ret);
+        printk(KERN_ERR "   Symbol 'kallsyms_lookup_name' not found\n");
+        return ret;
     }
+
+    /* 获取地址 */
+    addr = (unsigned long)kp_kallsyms_lookup_name.addr;
+
+    printk(KERN_INFO "✅ SUCCESS!\n");
+    printk(KERN_INFO "   kallsyms_lookup_name = 0x%lx\n", addr);
+    printk(KERN_INFO "========================================\n");
+
+    return 0;
 }
 
 /* ---------- 模块退出 ---------- */
-static void __exit test_exit(void)
+static void __exit finder_exit(void)
 {
-    printk(KERN_INFO "Test module unloaded\n");
+    unregister_kprobe(&kp_kallsyms_lookup_name);
+    printk(KERN_INFO "Finder module unloaded\n");
 }
 
-module_init(test_init);
-module_exit(test_exit);
+module_init(finder_init);
+module_exit(finder_exit);
