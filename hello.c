@@ -6,6 +6,9 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/kallsyms.h>
+#include <linux/file.h>      /* fget, fput */
+#include <linux/dcache.h>    /* d_path */
+#include <linux/path.h>      /* struct path */
 
 MODULE_LICENSE("GPL");
 
@@ -50,10 +53,10 @@ static int is_gps_device(unsigned int fd) {
     path = d_path(&file->f_path, path_buf, PATH_MAX);
     if (!IS_ERR(path)) {
         /* MTK GPS 设备匹配 */
-        if (strstr(path, "gpsmdl-nmea") ||    /* NMEA 数据 */
-            strstr(path, "gpsmdl-mnl") ||     /* 控制接口 */
-            strstr(path, "gps2scp") ||        /* GPS 通信 */
-            strstr(path, "gpsmdl-meas") ||    /* 测量数据 */
+        if (strstr(path, "gpsmdl-nmea") ||
+            strstr(path, "gpsmdl-mnl") ||
+            strstr(path, "gps2scp") ||
+            strstr(path, "gpsmdl-meas") ||
             strstr(path, "gps")) {
             ret = 1;
             printk(KERN_DEBUG "[GPS_HOOK] Found GPS device: %s\n", path);
@@ -95,7 +98,6 @@ static int pre_read_handler(struct kprobe *p, struct pt_regs *regs)
             printk(KERN_INFO "[GPS_HOOK] ✅ 注入假 NMEA 数据! (#%d, fd=%d)\n", 
                    hook_count, fd);
             printk(KERN_INFO "[GPS_HOOK] 📍 位置: 31°14'N 121°28'E (上海浦东)\n");
-            printk(KERN_INFO "[GPS_HOOK] 📊 数据: %s", fake_nmea_data);
             
             regs->regs[0] = copy_len;
             return 1;  /* 跳过原函数 */
@@ -143,7 +145,7 @@ static int __init gps_hook_init(void)
     
     printk(KERN_INFO "========================================\n");
     printk(KERN_INFO "[GPS_HOOK] MTK GPS kprobe 劫持模块 v3.0\n");
-    printk(KERN_INFO "[GPS_HOOK] 目标设备: gpsmdl-nmea, gps2scp\n");
+    printk(KERN_INFO "[GPS_HOOK] 目标: gpsmdl-nmea, gps2scp\n");
     printk(KERN_INFO "[GPS_HOOK] 假位置: 31°14'N 121°28'E (上海浦东)\n");
     printk(KERN_INFO "========================================\n");
     
@@ -172,7 +174,6 @@ static int __init gps_hook_init(void)
     }
     
     printk(KERN_INFO "[GPS_HOOK] ✅ 等待 GPS 数据被读取...\n");
-    printk(KERN_INFO "[GPS_HOOK] 运行: dmesg -w | grep GPS_HOOK\n");
     printk(KERN_INFO "========================================\n");
     
     return 0;
