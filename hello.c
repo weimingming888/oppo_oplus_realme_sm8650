@@ -11,38 +11,65 @@
 
 static struct kprobe kp_show_map_vma;
 
-#define TARGET_COMM "com.eltavine.duckdetector"
-
-/* ========== 通过进程名获取 PID ========== */
-static pid_t find_pid_by_comm(const char *comm)
-{
-    struct task_struct *task;
-    pid_t pid = -1;
-
-    rcu_read_lock();
-    for_each_process(task) {
-        if (strcmp(task->comm, comm) == 0) {
-            pid = task->pid;
-            break;
-        }
-    }
-    rcu_read_unlock();
-
-    return pid;
-}
-
-/* ========== kprobe 触发函数 ========== */
+/* ========== kprobe 触发函数（不过滤，打印所有） ========== */
 static int show_map_vma_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    pid_t pid;
+    struct seq_file *m;
+    struct vm_area_struct *vma;
+    struct mm_struct *mm;
+    struct task_struct *task;
+    char *path_buf = NULL;
+    char *path = NULL;
+    char flags[5];
 
-    printk(KERN_INFO "[KPROBE] show_map_vma 被调用");
+    /* show_map_vma 原型: void show_map_vma(struct seq_file *m, struct vm_area_struct *vma) */
+    /* ARM64: x0=seq_file, x1=vm_area_struct */
+    m = (struct seq_file *)regs->regs[0];
+    vma = (struct vm_area_struct *)regs->regs[1];
 
-    pid = find_pid_by_comm(TARGET_COMM);
-    if (pid > 0) {
-        printk(KERN_INFO "[KPROBE] ✅ 找到目标进程: %s (PID=%d)", TARGET_COMM, pid);
-    } else {
-        printk(KERN_INFO "[KPROBE] ⚠️ 未找到进程: %s", TARGET_COMM);
+    if (vma == NULL)
+        return 0;
+
+    mm = vma->vm_mm;
+    if (mm == NULL)
+        return 0;
+
+    /* 获取进程信息 */
+    task = mm->owner;
+    if (task == NULL)
+        return 0;
+
+    /* 构建权限标志 */
+    flags[0] = (vma->vm_flags & VM_READ) ? 'r' : '-';
+    flags[1] = (vma->vm_flags & VM_WRITE) ? 'w' : '-';
+    flags[2] = (vma->vm_flags & VM_EXEC) ? 'x' : '-';
+    flags[3] = (vma->vm_flags & VM_MAYSHARE) ? 's' : 'p';
+    flags[4] = '\0';
+
+    /* 获取文件路径 */
+    if (vma->vm_file != NULL) {
+        path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+        if (path_buf != NULL) {
+            path = d_path(&vma->vm_file->f_path, path_buf, PATH_MAX);
+            if (IS_ERR(path)) {
+                path = NULL;
+            }
+        }
+    }
+
+    /* 打印所有 VMA 信息（不过滤） */
+    printk(KERN_INFO "[MAPS] PID=%d COMM=%s %016lx-%016lx %s %08lx %s",
+           task->pid,
+           task->comm,
+           vma->vm_start,
+           vma->vm_end,
+           flags,
+           vma->vm_pgoff,
+           path ? path : "");
+
+    /* 释放路径缓冲区 */
+    if (path_buf != NULL && !IS_ERR(path_buf)) {
+        kfree(path_buf);
     }
 
     return 0;
@@ -52,34 +79,32 @@ static int show_map_vma_pre(struct kprobe *p, struct pt_regs *regs)
 static int __init kprobe_init(void)
 {
     int ret;
-    pid_t pid;
 
     printk(KERN_INFO "[KPROBE] 🔍 模块加载开始");
+    printk(KERN_INFO "[KPROBE] 📌 不过滤进程名，打印所有 show_map_vma 调用");
 
-    /* ===== 直接使用符号名注册 ===== */
     kp_show_map_vma.symbol_name = "show_map_vma";
     kp_show_map_vma.pre_handler = show_map_vma_pre;
 
     ret = register_kprobe(&kp_show_map_vma);
     if (ret == 0) {
         printk(KERN_INFO "[KPROBE] ✅ 已钩住 show_map_vma");
-        printk(KERN_INFO "[KPROBE] ⚡ 当 show_map_vma 被调用时将触发");
+        printk(KERN_INFO "[KPROBE] ⚡ 正在等待 show_map_vma 被调用...");
     } else {
         printk(KERN_WARNING "[KPROBE] ⚠️ show_map_vma 注册失败: %d", ret);
-        printk(KERN_INFO "[KPROBE] 💡 符号可能不存在或未导出");
-        return -1;
-    }
-
-    /* ===== 查找目标进程 ===== */
-    pid = find_pid_by_comm(TARGET_COMM);
-    if (pid > 0) {
-        printk(KERN_INFO "[KPROBE] ✅ 找到目标进程: %s (PID=%d)", TARGET_COMM, pid);
-    } else {
-        printk(KERN_WARNING "[KPROBE] ⚠️ 进程 %s 未找到", TARGET_COMM);
-        printk(KERN_INFO "[KPROBE] 💡 启动目标 App 后重新加载本模块");
+        printk(KERN_INFO "[KPROBE] 💡 尝试使用 show_map");
+        kp_show_map_vma.symbol_name = "show_map";
+        ret = register_kprobe(&kp_show_map_vma);
+        if (ret == 0) {
+            printk(KERN_INFO "[KPROBE] ✅ 已钩住 show_map");
+        } else {
+            printk(KERN_ERR "[KPROBE] ❌ 所有符号注册失败");
+            return -1;
+        }
     }
 
     printk(KERN_INFO "[KPROBE] 🚀 模块加载完成");
+    printk(KERN_INFO "[KPROBE] 💡 触发方式: cat /proc/<PID>/maps");
     return 0;
 }
 
@@ -93,4 +118,4 @@ module_init(kprobe_init);
 module_exit(kprobe_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Hook show_map_vma");
+MODULE_DESCRIPTION("Hook show_map_vma - print all VMA info");
