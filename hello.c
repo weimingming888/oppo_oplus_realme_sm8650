@@ -64,10 +64,10 @@ static void print_process_maps(pid_t pid)
     printk(KERN_INFO "[MAPS] 进程: %s (PID=%d)", task->comm, pid);
     printk(KERN_INFO "[MAPS] ========================================");
 
-    /* Linux 6.1 使用 mmap_lock */
-    mmap_read_lock(mm);
+    /* 使用 mmap_sem（老内核） */
+    down_read(&mm->mmap_sem);
 
-    /* 遍历 VMA */
+    /* 遍历 VMA - 使用 mm->mmap */
     for (vma = mm->mmap; vma != NULL; vma = vma->vm_next) {
         /* 构建权限标志 */
         flags[0] = (vma->vm_flags & VM_READ) ? 'r' : '-';
@@ -103,7 +103,7 @@ static void print_process_maps(pid_t pid)
         }
     }
 
-    mmap_read_unlock(mm);
+    up_read(&mm->mmap_sem);
 
     printk(KERN_INFO "[MAPS] ========================================");
     printk(KERN_INFO "[MAPS] VMA 数量: %d", mm->map_count);
@@ -173,4 +173,4 @@ module_init(kprobe_init);
 module_exit(kprobe_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Print process memory maps (Linux 6.1)");
+MODULE_DESCRIPTION("Print process memory maps");
