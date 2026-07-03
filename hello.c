@@ -3,202 +3,62 @@
 #include <linux/kprobes.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
-#include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/kallsyms.h>
-#include <linux/file.h>      /* fget, fput */
-#include <linux/dcache.h>    /* d_path */
-#include <linux/path.h>      /* struct path */
 
-MODULE_LICENSE("GPL");
+static struct kprobe kp;
 
-/* ============================================================
- *  伪造的 GPS NMEA 数据 (上海浦东)
- * ============================================================ */
-
-static const char fake_nmea_data[] =
-    "$GPGGA,123519.00,3114.0000,N,12128.0000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n"
-    "$GPGSA,A,3,07,02,26,27,09,04,15,,,,,1.8,1.0,1.5*33\r\n"
-    "$GPGSV,3,1,11,03,03,111,00,04,15,270,00,06,01,010,00,13,06,292,00*74\r\n"
-    "$GPRMC,123519.00,A,3114.0000,N,12128.0000,E,022.4,084.4,230394,003.1,W*6A\r\n";
-
-/* ============================================================
- *  kprobe 结构
- * ============================================================ */
-
-static struct kprobe kp_read;
-static struct kprobe kp_ioctl;
-static int hook_count = 0;
-
-/* ============================================================
- *  判断是否是 GPS 设备
- * ============================================================ */
-
-static int is_gps_device(unsigned int fd) {
-    struct file *file;
-    char *path_buf;
-    char *path;
-    int ret = 0;
-    
-    file = fget(fd);
-    if (!file)
-        return 0;
-    
-    path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
-    if (!path_buf) {
-        fput(file);
-        return 0;
-    }
-    
-    path = d_path(&file->f_path, path_buf, PATH_MAX);
-    if (!IS_ERR(path)) {
-        /* MTK GPS 设备匹配 */
-        if (strstr(path, "gpsmdl-nmea") ||
-            strstr(path, "gpsmdl-mnl") ||
-            strstr(path, "gps2scp") ||
-            strstr(path, "gpsmdl-meas") ||
-            strstr(path, "gps")) {
-            ret = 1;
-            printk(KERN_DEBUG "[GPS_HOOK] Found GPS device: %s\n", path);
-        }
-    }
-    
-    kfree(path_buf);
-    fput(file);
-    return ret;
-}
-
-/* ============================================================
- *  read pre_handler: 拦截 GPS 数据读取
- * ============================================================ */
-
-static int pre_read_handler(struct kprobe *p, struct pt_regs *regs)
+// kprobe 的前处理函数
+static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    unsigned int fd;
     char __user *buf;
-    size_t count;
-    
-    (void)p;
-    
-    fd = (unsigned int)regs->regs[0];
+    size_t len;
+    char *data;
+    int i;
+
+    // ARM64: x1 是第二个参数 (buf), x2 是第三个参数 (len)
     buf = (char __user *)regs->regs[1];
-    count = (size_t)regs->regs[2];
-    
-    if (!is_gps_device(fd))
-        return 0;
-    
-    hook_count++;
-    
-    /* 注入假 NMEA 数据 */
-    if (hook_count <= 5) {
-        size_t fake_len = strlen(fake_nmea_data);
-        size_t copy_len = (count < fake_len) ? count : fake_len;
-        
-        if (copy_to_user(buf, fake_nmea_data, copy_len) == 0) {
-            printk(KERN_INFO "[GPS_HOOK] ✅ 注入假 NMEA 数据! (#%d, fd=%d)\n", 
-                   hook_count, fd);
-            printk(KERN_INFO "[GPS_HOOK] 📍 位置: 31°14'N 121°28'E (上海浦东)\n");
-            
-            regs->regs[0] = copy_len;
-            return 1;  /* 跳过原函数 */
+    len = (size_t)regs->regs[2];
+
+    if (len > 0 && len < 1024) {
+        data = kmalloc(len + 1, GFP_ATOMIC);
+        if (data) {
+            // 从用户空间拷贝数据到内核空间
+            if (copy_from_user(data, buf, len) == 0) {
+                data[len] = '\0';
+                // 打印到内核日志
+                printk(KERN_INFO "gnss_read: len=%zu, data=%s\n", len, data);
+                // 同时打印十六进制
+                print_hex_dump(KERN_INFO, "gnss_raw: ", DUMP_PREFIX_OFFSET, 16, 1, data, len, true);
+            }
+            kfree(data);
         }
     }
-    
+
     return 0;
 }
 
-/* ============================================================
- *  ioctl pre_handler: 拦截 GPS 控制命令
- * ============================================================ */
-
-static int pre_ioctl_handler(struct kprobe *p, struct pt_regs *regs)
+static int __init kprobe_init(void)
 {
-    unsigned int fd;
-    unsigned int cmd;
-    unsigned long arg;
-    
-    (void)p;
-    
-    fd = (unsigned int)regs->regs[0];
-    cmd = (unsigned int)regs->regs[1];
-    arg = (unsigned long)regs->regs[2];
-    
-    if (!is_gps_device(fd))
-        return 0;
-    
-    /* 记录 ioctl 命令 */
-    if (cmd != 0) {
-        printk(KERN_DEBUG "[GPS_HOOK] ioctl: fd=%d, cmd=0x%x, arg=0x%lx\n", 
-               fd, cmd, arg);
-    }
-    
-    return 0;
-}
+    // 设置要探测的函数名
+    kp.symbol_name = "gnss_read";
+    kp.pre_handler = handler_pre;
 
-/* ============================================================
- *  模块初始化
- * ============================================================ */
-
-static int __init gps_hook_init(void)
-{
-    int ret;
-    
-    printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[GPS_HOOK] MTK GPS kprobe 劫持模块 v3.0\n");
-    printk(KERN_INFO "[GPS_HOOK] 目标: gpsmdl-nmea, gps2scp\n");
-    printk(KERN_INFO "[GPS_HOOK] 假位置: 31°14'N 121°28'E (上海浦东)\n");
-    printk(KERN_INFO "========================================\n");
-    
-    /* ====== Hook read ====== */
-    memset(&kp_read, 0, sizeof(struct kprobe));
-    kp_read.symbol_name = "__arm64_sys_read";
-    kp_read.pre_handler = pre_read_handler;
-    
-    ret = register_kprobe(&kp_read);
+    int ret = register_kprobe(&kp);
     if (ret < 0) {
-        printk(KERN_WARNING "[GPS_HOOK] ⚠️ __arm64_sys_read hook 失败: %d\n", ret);
-    } else {
-        printk(KERN_INFO "[GPS_HOOK] ✅ Hooked: __arm64_sys_read\n");
+        printk(KERN_ERR "register_kprobe failed: %d\n", ret);
+        return ret;
     }
-    
-    /* ====== Hook ioctl ====== */
-    memset(&kp_ioctl, 0, sizeof(struct kprobe));
-    kp_ioctl.symbol_name = "__arm64_sys_ioctl";
-    kp_ioctl.pre_handler = pre_ioctl_handler;
-    
-    ret = register_kprobe(&kp_ioctl);
-    if (ret < 0) {
-        printk(KERN_WARNING "[GPS_HOOK] ⚠️ __arm64_sys_ioctl hook 失败: %d\n", ret);
-    } else {
-        printk(KERN_INFO "[GPS_HOOK] ✅ Hooked: __arm64_sys_ioctl\n");
-    }
-    
-    printk(KERN_INFO "[GPS_HOOK] ✅ 等待 GPS 数据被读取...\n");
-    printk(KERN_INFO "========================================\n");
-    
+
+    printk(KERN_INFO "kprobe registered on gnss_read\n");
     return 0;
 }
 
-/* ============================================================
- *  模块卸载
- * ============================================================ */
-
-static void __exit gps_hook_exit(void)
+static void __exit kprobe_exit(void)
 {
-    unregister_kprobe(&kp_read);
-    unregister_kprobe(&kp_ioctl);
-    
-    printk(KERN_INFO "========================================\n");
-    printk(KERN_INFO "[GPS_HOOK] 模块卸载\n");
-    printk(KERN_INFO "[GPS_HOOK] 共拦截 %d 次 GPS 读取\n", hook_count);
-    printk(KERN_INFO "[GPS_HOOK] GPS 数据已恢复正常\n");
-    printk(KERN_INFO "========================================\n");
+    unregister_kprobe(&kp);
+    printk(KERN_INFO "kprobe unregistered\n");
 }
 
-module_init(gps_hook_init);
-module_exit(gps_hook_exit);
+module_init(kprobe_init);
+module_exit(kprobe_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("MTK GPS Hacker");
-MODULE_DESCRIPTION("kprobe-based GPS interception for MTK platform");
-MODULE_VERSION("3.0");
