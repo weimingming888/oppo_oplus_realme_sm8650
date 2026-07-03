@@ -23,7 +23,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
             if (copy_from_user(data, buf, len) == 0) {
                 data[len] = '\0';
                 printk(KERN_INFO "gnss_read: len=%zu, data=%s\n", len, data);
-                print_hex_dump(KERN_INFO, "gnss_raw: ", DUMP_PREFIX_OFFSET, 
+                print_hex_dump(KERN_INFO, "gnss_raw: ", DUMP_PREFIX_OFFSET,
                                16, 1, data, len, 1);
             }
             kfree(data);
@@ -40,8 +40,7 @@ static int __init kprobe_init(void)
 
     kp.symbol_name = "gnss_read";
     kp.pre_handler = handler_pre;
-    kp.post_handler = NULL;
-    kp.fault_handler = NULL;
+    /* post_handler 和 fault_handler 不需要显式赋值，默认为 NULL */
 
     ret = register_kprobe(&kp);
     if (ret < 0) {
