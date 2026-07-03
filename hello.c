@@ -3,6 +3,10 @@
 #include <linux/kprobes.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/file.h>
+#include <linux/path.h>
+#include <linux/dcache.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sched.h>
 
@@ -12,23 +16,51 @@ static struct kprobe kp_ioctl;
 static struct kprobe kp_open;
 static struct kprobe kp_close;
 
+/* 检查文件描述符对应的设备路径 */
+static int is_gps_device(unsigned int fd, char *buf, size_t buf_size)
+{
+    struct file *filp;
+    char *path_buf, *file_path;
+    int ret = 0;
+
+    filp = fget(fd);
+    if (filp == NULL)
+        return 0;
+
+    path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+    if (path_buf == NULL) {
+        fput(filp);
+        return 0;
+    }
+
+    file_path = d_path(&filp->f_path, path_buf, PATH_MAX);
+    fput(filp);
+
+    if (!IS_ERR(file_path) && strstr(file_path, "gpsmdl-nmea") != NULL) {
+        strncpy(buf, file_path, buf_size - 1);
+        buf[buf_size - 1] = '\0';
+        ret = 1;
+    }
+
+    kfree(path_buf);
+    return ret;
+}
+
 /* ========== read ========== */
 static int read_pre(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int fd = (unsigned int)regs->regs[0];
     size_t len = (size_t)regs->regs[2];
+    char path_buf[256] = {0};
     char comm[32];
-    /* 用更可靠的方式获取进程名 */
-    strncpy(comm, current->comm, sizeof(comm) - 1);
-    comm[sizeof(comm) - 1] = '\0';
     
-    /* 只打印合理的数据（过滤无效长度） */
-    if (len > 0 && len < 1024*1024) {
-        printk(KERN_INFO "[SYS_READ] PID=%d COMM=%s FD=%d LEN=%zu\n",
-               current->pid, comm, fd, len);
-    } else {
-        printk(KERN_INFO "[SYS_READ] PID=%d COMM=%s FD=%d LEN=INVALID(%zu)\n",
-               current->pid, comm, fd, len);
+    if (len == 0 || len > 4096)
+        return 0;
+
+    if (is_gps_device(fd, path_buf, sizeof(path_buf))) {
+        get_task_comm(comm, current);
+        printk(KERN_INFO "🎯 [GPS_READ] PID=%d COMM=%s FD=%d LEN=%zu PATH=%s\n",
+               current->pid, comm, fd, len, path_buf);
     }
     return 0;
 }
@@ -37,14 +69,13 @@ static int read_pre(struct kprobe *p, struct pt_regs *regs)
 static int write_pre(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int fd = (unsigned int)regs->regs[0];
-    size_t len = (size_t)regs->regs[2];
-    char comm[32];
-    strncpy(comm, current->comm, sizeof(comm) - 1);
-    comm[sizeof(comm) - 1] = '\0';
+    char path_buf[256] = {0};
     
-    if (len > 0 && len < 1024*1024) {
-        printk(KERN_INFO "[SYS_WRITE] PID=%d COMM=%s FD=%d LEN=%zu\n",
-               current->pid, comm, fd, len);
+    if (is_gps_device(fd, path_buf, sizeof(path_buf))) {
+        char comm[32];
+        get_task_comm(comm, current);
+        printk(KERN_INFO "🎯 [GPS_WRITE] PID=%d COMM=%s FD=%d PATH=%s\n",
+               current->pid, comm, fd, path_buf);
     }
     return 0;
 }
@@ -54,11 +85,14 @@ static int ioctl_pre(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int fd = (unsigned int)regs->regs[0];
     unsigned int cmd = (unsigned int)regs->regs[1];
-    char comm[32];
-    strncpy(comm, current->comm, sizeof(comm) - 1);
-    comm[sizeof(comm) - 1] = '\0';
-    printk(KERN_INFO "[SYS_IOCTL] PID=%d COMM=%s FD=%d CMD=0x%x\n",
-           current->pid, comm, fd, cmd);
+    char path_buf[256] = {0};
+    
+    if (is_gps_device(fd, path_buf, sizeof(path_buf))) {
+        char comm[32];
+        get_task_comm(comm, current);
+        printk(KERN_INFO "🎯 [GPS_IOCTL] PID=%d COMM=%s FD=%d CMD=0x%x PATH=%s\n",
+               current->pid, comm, fd, cmd, path_buf);
+    }
     return 0;
 }
 
@@ -66,21 +100,22 @@ static int ioctl_pre(struct kprobe *p, struct pt_regs *regs)
 static int open_pre(struct kprobe *p, struct pt_regs *regs)
 {
     const char __user *filename = (const char __user *)regs->regs[0];
-    int flags = (int)regs->regs[1];
-    char comm[32];
     char *name_buf;
-    strncpy(comm, current->comm, sizeof(comm) - 1);
-    comm[sizeof(comm) - 1] = '\0';
-
+    char comm[32];
+    
     name_buf = kmalloc(256, GFP_ATOMIC);
-    if (name_buf) {
-        if (strncpy_from_user(name_buf, filename, 255) > 0) {
-            name_buf[255] = '\0';
-            printk(KERN_INFO "[SYS_OPEN] PID=%d COMM=%s FILE=%s FLAGS=0x%x\n",
-                   current->pid, comm, name_buf, flags);
+    if (!name_buf)
+        return 0;
+    
+    if (strncpy_from_user(name_buf, filename, 255) > 0) {
+        name_buf[255] = '\0';
+        if (strstr(name_buf, "gpsmdl-nmea") != NULL) {
+            get_task_comm(comm, current);
+            printk(KERN_INFO "🎯 [GPS_OPEN] PID=%d COMM=%s FILE=%s\n",
+                   current->pid, comm, name_buf);
         }
-        kfree(name_buf);
     }
+    kfree(name_buf);
     return 0;
 }
 
@@ -88,11 +123,14 @@ static int open_pre(struct kprobe *p, struct pt_regs *regs)
 static int close_pre(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int fd = (unsigned int)regs->regs[0];
-    char comm[32];
-    strncpy(comm, current->comm, sizeof(comm) - 1);
-    comm[sizeof(comm) - 1] = '\0';
-    printk(KERN_INFO "[SYS_CLOSE] PID=%d COMM=%s FD=%d\n",
-           current->pid, comm, fd);
+    char path_buf[256] = {0};
+    
+    if (is_gps_device(fd, path_buf, sizeof(path_buf))) {
+        char comm[32];
+        get_task_comm(comm, current);
+        printk(KERN_INFO "🎯 [GPS_CLOSE] PID=%d COMM=%s FD=%d PATH=%s\n",
+               current->pid, comm, fd, path_buf);
+    }
     return 0;
 }
 
@@ -101,7 +139,6 @@ static int __init kprobe_init(void)
 {
     int ret = 0;
 
-    /* read */
     kp_read.symbol_name = "__arm64_sys_read";
     kp_read.pre_handler = read_pre;
     ret = register_kprobe(&kp_read);
@@ -109,9 +146,8 @@ static int __init kprobe_init(void)
         kp_read.symbol_name = "ksys_read";
         ret = register_kprobe(&kp_read);
     }
-    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ registered: read\n" : KERN_ERR "[KPROBE] ❌ FAILED: read\n");
+    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ GPS read 监控已启动\n" : KERN_ERR "[KPROBE] ❌ read 注册失败\n");
 
-    /* write */
     kp_write.symbol_name = "__arm64_sys_write";
     kp_write.pre_handler = write_pre;
     ret = register_kprobe(&kp_write);
@@ -119,9 +155,8 @@ static int __init kprobe_init(void)
         kp_write.symbol_name = "ksys_write";
         ret = register_kprobe(&kp_write);
     }
-    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ registered: write\n" : KERN_ERR "[KPROBE] ❌ FAILED: write\n");
+    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ GPS write 监控已启动\n" : KERN_ERR "[KPROBE] ❌ write 注册失败\n");
 
-    /* ioctl */
     kp_ioctl.symbol_name = "__arm64_sys_ioctl";
     kp_ioctl.pre_handler = ioctl_pre;
     ret = register_kprobe(&kp_ioctl);
@@ -129,9 +164,8 @@ static int __init kprobe_init(void)
         kp_ioctl.symbol_name = "ksys_ioctl";
         ret = register_kprobe(&kp_ioctl);
     }
-    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ registered: ioctl\n" : KERN_ERR "[KPROBE] ❌ FAILED: ioctl\n");
+    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ GPS ioctl 监控已启动\n" : KERN_ERR "[KPROBE] ❌ ioctl 注册失败\n");
 
-    /* open */
     kp_open.symbol_name = "__arm64_sys_open";
     kp_open.pre_handler = open_pre;
     ret = register_kprobe(&kp_open);
@@ -139,9 +173,8 @@ static int __init kprobe_init(void)
         kp_open.symbol_name = "__arm64_sys_openat";
         ret = register_kprobe(&kp_open);
     }
-    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ registered: open\n" : KERN_ERR "[KPROBE] ❌ FAILED: open\n");
+    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ GPS open 监控已启动\n" : KERN_ERR "[KPROBE] ❌ open 注册失败\n");
 
-    /* close */
     kp_close.symbol_name = "__arm64_sys_close";
     kp_close.pre_handler = close_pre;
     ret = register_kprobe(&kp_close);
@@ -149,9 +182,9 @@ static int __init kprobe_init(void)
         kp_close.symbol_name = "ksys_close";
         ret = register_kprobe(&kp_close);
     }
-    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ registered: close\n" : KERN_ERR "[KPROBE] ❌ FAILED: close\n");
+    printk(ret == 0 ? KERN_INFO "[KPROBE] ✅ GPS close 监控已启动\n" : KERN_ERR "[KPROBE] ❌ close 注册失败\n");
 
-    printk(KERN_INFO "[KPROBE] GPS数据流监控已启动！\n");
+    printk(KERN_INFO "[KPROBE] 🚀 GPS 数据流监控已就绪，等待 /dev/gpsmdl-nmea 被读取...\n");
     return 0;
 }
 
@@ -162,11 +195,11 @@ static void __exit kprobe_exit(void)
     unregister_kprobe(&kp_ioctl);
     unregister_kprobe(&kp_open);
     unregister_kprobe(&kp_close);
-    printk(KERN_INFO "[KPROBE] all unregistered\n");
+    printk(KERN_INFO "[KPROBE] 所有探针已卸载\n");
 }
 
 module_init(kprobe_init);
 module_exit(kprobe_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("kprobe test for read/write/ioctl/open/close");
+MODULE_DESCRIPTION("GPS kprobe monitor for /dev/gpsmdl-nmea");
