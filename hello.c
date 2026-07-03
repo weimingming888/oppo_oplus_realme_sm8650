@@ -3,112 +3,171 @@
 #include <linux/kprobes.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
-#include <linux/file.h>
-#include <linux/path.h>
-#include <linux/dcache.h>
-#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sched.h>
 
-static struct kprobe kp;
+static struct kprobe kp_read;
+static struct kprobe kp_write;
+static struct kprobe kp_ioctl;
+static struct kprobe kp_open;
+static struct kprobe kp_close;
 
-static int handler_pre(struct kprobe *p, struct pt_regs *regs)
+/* ========== read ========== */
+static int read_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    struct file *filp;
-    char __user *buf;
-    size_t len;
-    unsigned int fd;
-    char *data;
-    char *path_buf;
-    char *file_path;
+    unsigned int fd = (unsigned int)regs->regs[0];
+    size_t len = (size_t)regs->regs[2];
     char comm[TASK_COMM_LEN];
-    pid_t pid;
-
-    /* __arm64_sys_read: x0=fd, x1=buf, x2=len */
-    fd = (unsigned int)regs->regs[0];
-    buf = (char __user *)regs->regs[1];
-    len = (size_t)regs->regs[2];
-
-    if (len == 0 || len > 4096)
-        return 0;
-
-    /* 获取当前进程信息 */
-    pid = current->pid;
     get_task_comm(comm, current);
-
-    filp = fget(fd);
-    if (filp == NULL)
-        return 0;
-
-    path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
-    if (path_buf == NULL) {
-        fput(filp);
-        return 0;
-    }
-
-    file_path = d_path(&filp->f_path, path_buf, PATH_MAX);
-    fput(filp);
-
-    if (IS_ERR(file_path)) {
-        kfree(path_buf);
-        return 0;
-    }
-
-    /* 打印系统调用信息 */
-    printk(KERN_INFO "===== SYSCALL_READ =====\n");
-    printk(KERN_INFO "PID: %d, COMM: %s, FD: %d, LEN: %zu\n", pid, comm, fd, len);
-    printk(KERN_INFO "FILE: %s\n", file_path);
-
-    /* 读取数据内容 */
-    if (buf != NULL && len > 0) {
-        data = kmalloc(len + 1, GFP_ATOMIC);
-        if (data != NULL) {
-            if (copy_from_user(data, buf, len) == 0) {
-                data[len] = '\0';
-                /* 打印前 256 字节 */
-                printk(KERN_INFO "DATA[%zu]: %s\n", len, data);
-                /* 同时打印十六进制（前64字节） */
-                print_hex_dump(KERN_INFO, "HEX: ", DUMP_PREFIX_OFFSET, 16, 1,
-                               data, min(len, (size_t)64), 1);
-            } else {
-                printk(KERN_INFO "DATA: failed to copy from user\n");
-            }
-            kfree(data);
-        }
-    }
-
-    printk(KERN_INFO "=========================\n");
-
-    kfree(path_buf);
+    printk(KERN_INFO "[SYS_READ] PID=%d COMM=%s FD=%d LEN=%zu",
+           current->pid, comm, fd, len);
     return 0;
 }
 
+/* ========== write ========== */
+static int write_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    unsigned int fd = (unsigned int)regs->regs[0];
+    size_t len = (size_t)regs->regs[2];
+    char comm[TASK_COMM_LEN];
+    get_task_comm(comm, current);
+    printk(KERN_INFO "[SYS_WRITE] PID=%d COMM=%s FD=%d LEN=%zu",
+           current->pid, comm, fd, len);
+    return 0;
+}
+
+/* ========== ioctl ========== */
+static int ioctl_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    unsigned int fd = (unsigned int)regs->regs[0];
+    unsigned int cmd = (unsigned int)regs->regs[1];
+    char comm[TASK_COMM_LEN];
+    get_task_comm(comm, current);
+    printk(KERN_INFO "[SYS_IOCTL] PID=%d COMM=%s FD=%d CMD=0x%x",
+           current->pid, comm, fd, cmd);
+    return 0;
+}
+
+/* ========== open ========== */
+static int open_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    const char __user *filename = (const char __user *)regs->regs[0];
+    int flags = (int)regs->regs[1];
+    char comm[TASK_COMM_LEN];
+    char *name_buf;
+    get_task_comm(comm, current);
+
+    name_buf = kmalloc(256, GFP_ATOMIC);
+    if (name_buf) {
+        if (strncpy_from_user(name_buf, filename, 255) > 0) {
+            name_buf[255] = '\0';
+            printk(KERN_INFO "[SYS_OPEN] PID=%d COMM=%s FILE=%s FLAGS=0x%x",
+                   current->pid, comm, name_buf, flags);
+        }
+        kfree(name_buf);
+    }
+    return 0;
+}
+
+/* ========== close ========== */
+static int close_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    unsigned int fd = (unsigned int)regs->regs[0];
+    char comm[TASK_COMM_LEN];
+    get_task_comm(comm, current);
+    printk(KERN_INFO "[SYS_CLOSE] PID=%d COMM=%s FD=%d",
+           current->pid, comm, fd);
+    return 0;
+}
+
+/* ==================================================== */
+/* 注册所有探针 */
+
 static int __init kprobe_init(void)
 {
-    int ret;
+    int ret = 0;
 
-    kp.symbol_name = "__arm64_sys_read";
-    kp.pre_handler = handler_pre;
-
-    ret = register_kprobe(&kp);
+    /* read */
+    kp_read.symbol_name = "__arm64_sys_read";
+    kp_read.pre_handler = read_pre;
+    ret = register_kprobe(&kp_read);
     if (ret < 0) {
-        printk(KERN_ERR "register_kprobe failed: %d\n", ret);
-        return ret;
+        /* 如果不行，换 ksys_read */
+        kp_read.symbol_name = "ksys_read";
+        ret = register_kprobe(&kp_read);
     }
+    if (ret == 0)
+        printk(KERN_INFO "[KPROBE] registered: read\n");
+    else
+        printk(KERN_ERR "[KPROBE] FAILED: read\n");
 
-    printk(KERN_INFO "kprobe registered on __arm64_sys_read at %p\n", kp.addr);
+    /* write */
+    kp_write.symbol_name = "__arm64_sys_write";
+    kp_write.pre_handler = write_pre;
+    ret = register_kprobe(&kp_write);
+    if (ret < 0) {
+        kp_write.symbol_name = "ksys_write";
+        ret = register_kprobe(&kp_write);
+    }
+    if (ret == 0)
+        printk(KERN_INFO "[KPROBE] registered: write\n");
+    else
+        printk(KERN_ERR "[KPROBE] FAILED: write\n");
+
+    /* ioctl */
+    kp_ioctl.symbol_name = "__arm64_sys_ioctl";
+    kp_ioctl.pre_handler = ioctl_pre;
+    ret = register_kprobe(&kp_ioctl);
+    if (ret < 0) {
+        kp_ioctl.symbol_name = "ksys_ioctl";
+        ret = register_kprobe(&kp_ioctl);
+    }
+    if (ret == 0)
+        printk(KERN_INFO "[KPROBE] registered: ioctl\n");
+    else
+        printk(KERN_ERR "[KPROBE] FAILED: ioctl\n");
+
+    /* open */
+    kp_open.symbol_name = "__arm64_sys_open";
+    kp_open.pre_handler = open_pre;
+    ret = register_kprobe(&kp_open);
+    if (ret < 0) {
+        kp_open.symbol_name = "__arm64_sys_openat";
+        ret = register_kprobe(&kp_open);
+    }
+    if (ret == 0)
+        printk(KERN_INFO "[KPROBE] registered: open\n");
+    else
+        printk(KERN_ERR "[KPROBE] FAILED: open\n");
+
+    /* close */
+    kp_close.symbol_name = "__arm64_sys_close";
+    kp_close.pre_handler = close_pre;
+    ret = register_kprobe(&kp_close);
+    if (ret < 0) {
+        kp_close.symbol_name = "ksys_close";
+        ret = register_kprobe(&kp_close);
+    }
+    if (ret == 0)
+        printk(KERN_INFO "[KPROBE] registered: close\n");
+    else
+        printk(KERN_ERR "[KPROBE] FAILED: close\n");
+
     return 0;
 }
 
 static void __exit kprobe_exit(void)
 {
-    unregister_kprobe(&kp);
-    printk(KERN_INFO "kprobe unregistered\n");
+    unregister_kprobe(&kp_read);
+    unregister_kprobe(&kp_write);
+    unregister_kprobe(&kp_ioctl);
+    unregister_kprobe(&kp_open);
+    unregister_kprobe(&kp_close);
+    printk(KERN_INFO "[KPROBE] all unregistered\n");
 }
 
 module_init(kprobe_init);
 module_exit(kprobe_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Kprobe GPS Debug");
-MODULE_DESCRIPTION("Capture all sys_read calls with data dump");
+MODULE_DESCRIPTION("kprobe test for read/write/ioctl/open/close");
