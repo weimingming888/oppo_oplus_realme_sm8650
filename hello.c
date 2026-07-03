@@ -21,7 +21,6 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
     char *file_path;
     unsigned int fd;
 
-    /* __arm64_sys_read: x0=fd, x1=buf, x2=len */
     fd = (unsigned int)regs->regs[0];
     buf = (char __user *)regs->regs[1];
     len = (size_t)regs->regs[2];
@@ -49,14 +48,13 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 
     /* 只过滤 /dev/gpsmdl-nmea */
     if (strstr(file_path, "gpsmdl-nmea") != NULL) {
-
         data = kmalloc(len + 1, GFP_ATOMIC);
         if (data != NULL) {
             if (copy_from_user(data, buf, len) == 0) {
                 data[len] = '\0';
-                /* 只打印以 $ 开头的 NMEA 句子 */
+                /* 打印 NMEA 句子（以 $ 开头） */
                 if (data[0] == '$') {
-                    printk(KERN_INFO "GPS_NMEA: %s\n", data);
+                    printk(KERN_INFO "GPS_MD_READ: %s\n", data);
                 }
             }
             kfree(data);
@@ -71,16 +69,22 @@ static int __init kprobe_init(void)
 {
     int ret;
 
-    kp.symbol_name = "__arm64_sys_read";
+    /* 使用 sys_read（不区分架构） */
+    kp.symbol_name = "sys_read";
     kp.pre_handler = handler_pre;
 
     ret = register_kprobe(&kp);
     if (ret < 0) {
-        printk(KERN_ERR "register_kprobe failed: %d\n", ret);
-        return ret;
+        /* 如果 sys_read 不行，试试 ksys_read */
+        kp.symbol_name = "ksys_read";
+        ret = register_kprobe(&kp);
+        if (ret < 0) {
+            printk(KERN_ERR "register_kprobe failed on both sys_read and ksys_read\n");
+            return ret;
+        }
     }
 
-    printk(KERN_INFO "kprobe registered on __arm64_sys_read (gpsmdl-nmea)\n");
+    printk(KERN_INFO "kprobe registered on %s\n", kp.symbol_name);
     return 0;
 }
 
