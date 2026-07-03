@@ -52,8 +52,8 @@ static int read_pre(struct kprobe *p, struct pt_regs *regs)
     unsigned int fd = (unsigned int)regs->regs[0];
     size_t len = (size_t)regs->regs[2];
     char path_buf[256] = {0};
-    char comm[32];
-    
+    char comm[TASK_COMM_LEN];
+
     if (len == 0 || len > 4096)
         return 0;
 
@@ -70,9 +70,9 @@ static int write_pre(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int fd = (unsigned int)regs->regs[0];
     char path_buf[256] = {0};
-    
+    char comm[TASK_COMM_LEN];
+
     if (is_gps_device(fd, path_buf, sizeof(path_buf))) {
-        char comm[32];
         get_task_comm(comm, current);
         printk(KERN_INFO "🎯 [GPS_WRITE] PID=%d COMM=%s FD=%d PATH=%s\n",
                current->pid, comm, fd, path_buf);
@@ -86,9 +86,9 @@ static int ioctl_pre(struct kprobe *p, struct pt_regs *regs)
     unsigned int fd = (unsigned int)regs->regs[0];
     unsigned int cmd = (unsigned int)regs->regs[1];
     char path_buf[256] = {0};
-    
+    char comm[TASK_COMM_LEN];
+
     if (is_gps_device(fd, path_buf, sizeof(path_buf))) {
-        char comm[32];
         get_task_comm(comm, current);
         printk(KERN_INFO "🎯 [GPS_IOCTL] PID=%d COMM=%s FD=%d CMD=0x%x PATH=%s\n",
                current->pid, comm, fd, cmd, path_buf);
@@ -101,12 +101,12 @@ static int open_pre(struct kprobe *p, struct pt_regs *regs)
 {
     const char __user *filename = (const char __user *)regs->regs[0];
     char *name_buf;
-    char comm[32];
-    
+    char comm[TASK_COMM_LEN];
+
     name_buf = kmalloc(256, GFP_ATOMIC);
     if (!name_buf)
         return 0;
-    
+
     if (strncpy_from_user(name_buf, filename, 255) > 0) {
         name_buf[255] = '\0';
         if (strstr(name_buf, "gpsmdl-nmea") != NULL) {
@@ -124,9 +124,9 @@ static int close_pre(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int fd = (unsigned int)regs->regs[0];
     char path_buf[256] = {0};
-    
+    char comm[TASK_COMM_LEN];
+
     if (is_gps_device(fd, path_buf, sizeof(path_buf))) {
-        char comm[32];
         get_task_comm(comm, current);
         printk(KERN_INFO "🎯 [GPS_CLOSE] PID=%d COMM=%s FD=%d PATH=%s\n",
                current->pid, comm, fd, path_buf);
