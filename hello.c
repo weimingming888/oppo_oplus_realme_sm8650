@@ -33,35 +33,6 @@ static char nmea_checksum(const char *str)
     return checksum;
 }
 
-/* ========== 重建 NMEA 语句并计算校验和 ========== */
-static void rebuild_nmea(char *buf, size_t buf_len, const char *prefix,
-                         const char *time, const char *lat, const char *lon,
-                         const char *status, const char *satellites,
-                         const char *hdop, const char *alt)
-{
-    char new_stmt[512];
-    char checksum_str[4];
-    unsigned char checksum;
-    size_t len;
-
-    /* 构建不含校验和的语句 */
-    snprintf(new_stmt, sizeof(new_stmt),
-             "%s,%s,%s,N,%s,E,%s,%s,%s,%s,M,0.0,M,,",
-             prefix, time, lat, lon, status, satellites, hdop, alt);
-
-    /* 计算校验和 */
-    checksum = nmea_checksum(new_stmt);
-
-    /* 追加校验和 */
-    len = strlen(new_stmt);
-    snprintf(new_stmt + len, sizeof(new_stmt) - len, "*%02X", checksum);
-
-    /* 写回缓冲区（确保不溢出） */
-    memset(buf, 0, buf_len);
-    strncpy(buf, new_stmt, buf_len - 1);
-    buf[buf_len - 1] = '\0';
-}
-
 /* ========== 修改 GGA 语句 ========== */
 static int modify_gga(char *buf, size_t len)
 {
@@ -81,6 +52,7 @@ static int modify_gga(char *buf, size_t len)
 
     /* 按逗号分割 */
     p = tmp;
+    saveptr = NULL;
     while ((token = strsep(&p, ",")) != NULL && i < 20) {
         fields[i++] = token;
     }
@@ -150,6 +122,7 @@ static int modify_rmc(char *buf, size_t len)
     tmp[sizeof(tmp) - 1] = '\0';
 
     p = tmp;
+    saveptr = NULL;
     while ((token = strsep(&p, ",")) != NULL && i < 20) {
         fields[i++] = token;
     }
