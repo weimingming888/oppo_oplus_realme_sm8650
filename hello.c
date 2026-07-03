@@ -5,10 +5,9 @@
 #include <linux/pid.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
-#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/dcache.h>
+#include <linux/seq_file.h>
 
 static struct kprobe kp_show_maps;
 
@@ -32,98 +31,116 @@ static pid_t find_pid_by_comm(const char *comm)
     return pid;
 }
 
-/* ========== 打印进程的内存映射 ========== */
-static void print_process_maps(pid_t pid)
+/* ========== 获取进程的 mm_struct ========== */
+static struct mm_struct *get_task_mm_struct(pid_t pid)
 {
     struct task_struct *task;
-    struct mm_struct *mm;
-    struct vm_area_struct *vma;
-    struct file *file;
-    char *path_buf;
-    char *path;
-    char flags[5];
+    struct mm_struct *mm = NULL;
 
     rcu_read_lock();
     task = find_task_by_vpid(pid);
-    if (task == NULL) {
-        rcu_read_unlock();
-        printk(KERN_ERR "[MAPS] 找不到进程 PID=%d\n", pid);
-        return;
+    if (task != NULL) {
+        get_task_struct(task);
+        mm = task->mm;
+        if (mm != NULL) {
+            mmget(mm);
+        }
+        put_task_struct(task);
     }
-    get_task_struct(task);
     rcu_read_unlock();
 
-    mm = task->mm;
+    return mm;
+}
+
+/* ========== 通过 show_maps 打印进程内存映射 ========== */
+static void print_maps_via_show_maps(pid_t pid)
+{
+    struct mm_struct *mm;
+    struct seq_file *seq;
+    char *buf;
+    loff_t pos = 0;
+    int ret;
+
+    mm = get_task_mm_struct(pid);
     if (mm == NULL) {
-        printk(KERN_ERR "[MAPS] 进程没有 mm_struct\n");
-        put_task_struct(task);
+        printk(KERN_ERR "[MAPS] 无法获取 mm_struct\n");
         return;
     }
 
     printk(KERN_INFO "[MAPS] ========================================");
-    printk(KERN_INFO "[MAPS] 进程: %s (PID=%d)", task->comm, pid);
+    printk(KERN_INFO "[MAPS] 通过 show_maps 打印进程 %s (PID=%d) 的内存映射", TARGET_COMM, pid);
     printk(KERN_INFO "[MAPS] ========================================");
 
-    /* 使用 mmap_sem（老内核） */
-    down_read(&mm->mmap_sem);
-
-    /* 遍历 VMA - 使用 mm->mmap */
-    for (vma = mm->mmap; vma != NULL; vma = vma->vm_next) {
-        /* 构建权限标志 */
-        flags[0] = (vma->vm_flags & VM_READ) ? 'r' : '-';
-        flags[1] = (vma->vm_flags & VM_WRITE) ? 'w' : '-';
-        flags[2] = (vma->vm_flags & VM_EXEC) ? 'x' : '-';
-        flags[3] = (vma->vm_flags & VM_MAYSHARE) ? 's' : 'p';
-        flags[4] = '\0';
-
-        /* 获取文件路径 */
-        file = vma->vm_file;
-        path = NULL;
-        if (file != NULL) {
-            path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
-            if (path_buf != NULL) {
-                path = d_path(&file->f_path, path_buf, PATH_MAX);
-                if (IS_ERR(path)) {
-                    path = NULL;
-                    kfree(path_buf);
-                }
-            }
-        }
-
-        printk(KERN_INFO "[MAPS] %016lx-%016lx %s %08lx %s",
-               vma->vm_start,
-               vma->vm_end,
-               flags,
-               vma->vm_pgoff,
-               path ? path : "");
-
-        /* 释放路径缓冲区 */
-        if (file != NULL && path != NULL && !IS_ERR(path)) {
-            kfree(path);
-        }
+    /* 创建 seq_file 缓冲区 */
+    buf = kmalloc(16384, GFP_ATOMIC);
+    if (buf == NULL) {
+        mmput(mm);
+        printk(KERN_ERR "[MAPS] 内存分配失败\n");
+        return;
     }
 
-    up_read(&mm->mmap_sem);
+    seq = kmalloc(sizeof(struct seq_file), GFP_ATOMIC);
+    if (seq == NULL) {
+        kfree(buf);
+        mmput(mm);
+        printk(KERN_ERR "[MAPS] seq_file 分配失败\n");
+        return;
+    }
+
+    /* 初始化 seq_file */
+    memset(seq, 0, sizeof(struct seq_file));
+    seq->buf = buf;
+    seq->size = 16384;
+    seq->count = 0;
+
+    /* 直接调用 show_maps (内核符号) */
+    /* void show_maps(struct seq_file *m, struct mm_struct *mm) */
+    show_maps(seq, mm);
+
+    /* 打印结果 */
+    if (seq->count > 0) {
+        buf[seq->count] = '\0';
+        printk(KERN_INFO "[MAPS]\n%s", buf);
+    } else {
+        printk(KERN_INFO "[MAPS] 没有输出 (show_maps 可能未产生数据)");
+    }
 
     printk(KERN_INFO "[MAPS] ========================================");
-    printk(KERN_INFO "[MAPS] VMA 数量: %d", mm->map_count);
 
-    put_task_struct(task);
+    kfree(seq->buf);
+    kfree(seq);
+    mmput(mm);
 }
 
 /* ========== kprobe 触发函数 ========== */
 static int show_maps_pre(struct kprobe *p, struct pt_regs *regs)
 {
+    struct seq_file *seq;
+    struct mm_struct *mm;
     pid_t pid;
 
-    printk(KERN_INFO "[KPROBE] show_maps 被调用");
+    /* show_maps 原型: void show_maps(struct seq_file *m, struct mm_struct *mm) */
+    /* ARM64: x0=seq_file, x1=mm_struct */
+    seq = (struct seq_file *)regs->regs[0];
+    mm = (struct mm_struct *)regs->regs[1];
+
+    printk(KERN_INFO "[KPROBE] show_maps 被调用 (seq=%p, mm=%p)", seq, mm);
 
     pid = find_pid_by_comm(TARGET_COMM);
     if (pid > 0) {
         printk(KERN_INFO "[KPROBE] 找到目标进程: %s (PID=%d)", TARGET_COMM, pid);
-        print_process_maps(pid);
-    } else {
-        printk(KERN_INFO "[KPROBE] 未找到进程: %s", TARGET_COMM);
+        /* 打印当前 show_maps 调用的进程信息 */
+        if (mm != NULL) {
+            struct task_struct *task = mm->owner;
+            if (task != NULL) {
+                printk(KERN_INFO "[KPROBE] show_maps 正在打印进程: %s (PID=%d)",
+                       task->comm, task->pid);
+                /* 如果是目标进程，额外打印完整信息 */
+                if (strcmp(task->comm, TARGET_COMM) == 0) {
+                    printk(KERN_INFO "[KPROBE] ✅ 目标进程内存映射开始...");
+                }
+            }
+        }
     }
 
     return 0;
@@ -135,31 +152,34 @@ static int __init kprobe_init(void)
     int ret;
     pid_t pid;
 
-    /* 尝试钩住 show_maps */
+    printk(KERN_INFO "[KPROBE] 🔍 模块加载开始");
+
+    /* 检查 show_maps 符号是否存在 */
     kp_show_maps.symbol_name = "show_maps";
     kp_show_maps.pre_handler = show_maps_pre;
 
     ret = register_kprobe(&kp_show_maps);
     if (ret == 0) {
-        printk(KERN_INFO "[KPROBE] ✅ 已钩住 show_maps");
-        printk(KERN_INFO "[KPROBE] 🎯 目标进程: %s", TARGET_COMM);
-        printk(KERN_INFO "[KPROBE] ⚡ 当 show_maps 被调用时，将打印目标进程的内存映射");
-        return 0;
+        printk(KERN_INFO "[KPROBE] ✅ 已钩住 show_maps (地址: %p)", kp_show_maps.addr);
+        printk(KERN_INFO "[KPROBE] ⚡ 当 show_maps 被调用时将触发");
+    } else {
+        printk(KERN_ERR "[KPROBE] ❌ show_maps 注册失败: %d", ret);
+        printk(KERN_INFO "[KPROBE] 💡 提示: 符号可能不存在或内核未导出");
+        return -1;
     }
 
-    printk(KERN_ERR "[KPROBE] ❌ show_maps 注册失败: %d", ret);
-
-    /* 如果无法钩住 show_maps，在初始化时直接打印 */
-    printk(KERN_INFO "[KPROBE] 🔄 尝试直接打印进程内存映射...");
-
+    /* 查找目标进程并手动触发打印 */
     pid = find_pid_by_comm(TARGET_COMM);
     if (pid > 0) {
-        print_process_maps(pid);
-        printk(KERN_INFO "[KPROBE] ✅ 内存映射已打印");
+        printk(KERN_INFO "[KPROBE] ✅ 找到目标进程: %s (PID=%d)", TARGET_COMM, pid);
+        /* 直接调用 show_maps 打印目标进程的内存映射 */
+        print_maps_via_show_maps(pid);
     } else {
-        printk(KERN_ERR "[KPROBE] ❌ 进程 %s 未找到", TARGET_COMM);
+        printk(KERN_WARNING "[KPROBE] ⚠️ 进程 %s 未找到", TARGET_COMM);
+        printk(KERN_INFO "[KPROBE] 💡 启动目标 App 后，show_maps 被调用时会自动打印");
     }
 
+    printk(KERN_INFO "[KPROBE] 🚀 模块加载完成");
     return 0;
 }
 
@@ -173,4 +193,4 @@ module_init(kprobe_init);
 module_exit(kprobe_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Print process memory maps");
+MODULE_DESCRIPTION("Print process maps via show_maps symbol");
