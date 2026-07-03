@@ -5,227 +5,19 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 
+static struct kprobe kp_proc;
 static struct kprobe kp_recv;
+static struct kprobe kp_parse;
 static struct kprobe kp_submit;
+static struct kprobe kp_read_link;
+static struct kprobe kp_send;
 
-/* 目标坐标（上海东方明珠） */
-#define FAKE_LAT "3123.0400"    /* 31°23.0400' N */
-#define FAKE_LON "12128.3700"   /* 121°28.3700' E */
-#define FAKE_ALT "10.0"         /* 海拔 10 米 */
-#define FAKE_SATELLITES "12"    /* 12颗卫星 */
-#define FAKE_HDOP "0.8"         /* HDOP 0.8 */
-
-/* ========== NMEA 校验和计算 ========== */
-static char nmea_checksum(const char *str)
-{
-    char ch;
-    char checksum = 0;
-    int i = 0;
-
-    if (str[0] == '$')
-        i = 1;
-
-    while ((ch = str[i]) != '\0' && ch != '*' && ch != '\r' && ch != '\n') {
-        checksum ^= ch;
-        i++;
-    }
-
-    return checksum;
-}
-
-/* ========== 修改 GGA 语句 ========== */
-static void modify_gga(char *buf, size_t len)
-{
-    char tmp[512];
-    char *fields[20];
-    int i = 0;
-    char *p, *saveptr;
-    char final[512];
-    unsigned char checksum;
-
-    if (len < 10 || len > 512)
-        return;
-
-    memset(tmp, 0, sizeof(tmp));
-    strncpy(tmp, buf, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-
-    p = tmp;
-    saveptr = NULL;
-    while ((p != NULL) && (saveptr = strsep(&p, ",")) != NULL && i < 20) {
-        fields[i++] = saveptr;
-    }
-
-    if (i < 6)
-        return;
-
-    /* fields[0] = $GNGGA 或 $GPGGA */
-    /* fields[1] = UTC 时间 */
-    /* fields[2] = 纬度 */
-    /* fields[3] = N/S */
-    /* fields[4] = 经度 */
-    /* fields[5] = E/W */
-    /* fields[6] = 定位状态 (0=无效, 1=GPS, 2=差分) */
-    /* fields[7] = 卫星数 */
-    /* fields[8] = HDOP */
-    /* fields[9] = 海拔 */
-
-    /* 修改关键字段 */
-    fields[6] = "1";                    /* 定位状态: 有效 */
-    fields[7] = FAKE_SATELLITES;        /* 卫星数: 12 颗 */
-    fields[8] = FAKE_HDOP;              /* HDOP: 0.8 */
-    fields[9] = FAKE_ALT;               /* 海拔: 10米 */
-
-    /* 重建 GGA */
-    snprintf(tmp, sizeof(tmp),
-             "%s,%s,%s,N,%s,E,%s,%s,%s,%s,M,0.0,M,,",
-             fields[0],   /* $GNGGA */
-             fields[1],   /* 时间 */
-             FAKE_LAT,    /* 纬度 */
-             FAKE_LON,    /* 经度 */
-             fields[6],   /* 定位状态 */
-             fields[7],   /* 卫星数 */
-             fields[8],   /* HDOP */
-             fields[9]);  /* 海拔 */
-
-    /* 计算校验和 */
-    checksum = nmea_checksum(tmp);
-    snprintf(final, sizeof(final), "%s*%02X", tmp, checksum);
-
-    /* 写回原缓冲区 */
-    memset(buf, 0, len);
-    strncpy(buf, final, len - 1);
-    buf[len - 1] = '\0';
-
-    printk(KERN_INFO "🔄 [GGA_FAKE] %s\n", final);
-}
-
-/* ========== 修改 RMC 语句 ========== */
-static void modify_rmc(char *buf, size_t len)
-{
-    char tmp[512];
-    char *fields[20];
-    int i = 0;
-    char *p, *saveptr;
-    char final[512];
-    unsigned char checksum;
-
-    if (len < 10 || len > 512)
-        return;
-
-    memset(tmp, 0, sizeof(tmp));
-    strncpy(tmp, buf, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-
-    p = tmp;
-    saveptr = NULL;
-    while ((p != NULL) && (saveptr = strsep(&p, ",")) != NULL && i < 20) {
-        fields[i++] = saveptr;
-    }
-
-    if (i < 6)
-        return;
-
-    /* fields[0] = $GNRMC 或 $GPRMC */
-    /* fields[1] = UTC 时间 */
-    /* fields[2] = 状态 (A=有效, V=无效) */
-    /* fields[3] = 纬度 */
-    /* fields[4] = N/S */
-    /* fields[5] = 经度 */
-    /* fields[6] = E/W */
-    /* fields[7] = 速度 */
-    /* fields[8] = 航向 */
-    /* fields[9] = 日期 */
-    /* fields[10] = 磁偏角 */
-
-    /* 修改为有效定位 */
-    fields[2] = "A";          /* 定位状态: 有效 */
-    fields[3] = FAKE_LAT;     /* 纬度 */
-    fields[5] = FAKE_LON;     /* 经度 */
-    fields[7] = "0.0";        /* 速度: 0节 */
-    fields[8] = "0.0";        /* 航向: 0度 */
-
-    /* 重建 RMC */
-    snprintf(tmp, sizeof(tmp),
-             "%s,%s,%s,%s,N,%s,E,%s,%s,%s,%s,%s,",
-             fields[0],   /* $GNRMC */
-             fields[1],   /* 时间 */
-             fields[2],   /* 状态 */
-             fields[3],   /* 纬度 */
-             fields[5],   /* 经度 */
-             fields[7],   /* 速度 */
-             fields[8],   /* 航向 */
-             fields[9],   /* 日期 */
-             fields[10],  /* 磁偏角 */
-             fields[11]); /* 磁偏角方向 */
-
-    /* 计算校验和 */
-    checksum = nmea_checksum(tmp);
-    snprintf(final, sizeof(final), "%s*%02X", tmp, checksum);
-
-    /* 写回原缓冲区 */
-    memset(buf, 0, len);
-    strncpy(buf, final, len - 1);
-    buf[len - 1] = '\0';
-
-    printk(KERN_INFO "🔄 [RMC_FAKE] %s\n", final);
-}
-
-/* ========== 处理 NMEA 数据包 ========== */
-static void process_nmea(char *buf, size_t len, const char *source)
-{
-    char *p;
-    char line[512];
-    int line_len;
-
-    if (buf == NULL || len == 0)
-        return;
-
-    p = buf;
-    while (*p != '\0' && (p - buf) < len) {
-        char *end = strchr(p, '\n');
-        if (end == NULL)
-            break;
-
-        line_len = end - p;
-        if (line_len > 0 && line_len < sizeof(line) - 1) {
-            memset(line, 0, sizeof(line));
-            strncpy(line, p, line_len);
-            line[line_len] = '\0';
-
-            /* 去掉 \r */
-            if (line_len > 0 && line[line_len - 1] == '\r')
-                line[line_len - 1] = '\0';
-
-            /* 打印原始数据 */
-            if (line[0] == '$') {
-                printk(KERN_INFO "📡 [%s] %s\n", source, line);
-            }
-
-            /* 修改 GGA */
-            if (strstr(line, "GGA") != NULL) {
-                modify_gga(line, sizeof(line));
-                memset(p, 0, end - p + 1);
-                strncpy(p, line, strlen(line));
-                strncpy(p + strlen(line), "\n", 1);
-            }
-            /* 修改 RMC */
-            else if (strstr(line, "RMC") != NULL) {
-                modify_rmc(line, sizeof(line));
-                memset(p, 0, end - p + 1);
-                strncpy(p, line, strlen(line));
-                strncpy(p + strlen(line), "\n", 1);
-            }
-        }
-        p = end + 1;
-    }
-}
-
-/* ========== recv_pre ========== */
-static int recv_pre(struct kprobe *p, struct pt_regs *regs)
+/* ========== 打印所有数据（ASCII + HEX） ========== */
+static void dump_all_data(struct pt_regs *regs, const char *func_name)
 {
     char *data_ptr;
     size_t data_len;
+    char *buf;
     unsigned long arg0, arg1, arg2;
 
     arg0 = regs->regs[0];
@@ -241,35 +33,97 @@ static int recv_pre(struct kprobe *p, struct pt_regs *regs)
     }
 
     if (data_ptr == NULL || data_len == 0 || data_len > 4096)
-        return 0;
+        return;
 
-    process_nmea(data_ptr, data_len, "RECV");
+    buf = kmalloc(data_len + 1, GFP_ATOMIC);
+    if (buf == NULL)
+        return;
+
+    memcpy(buf, data_ptr, data_len);
+    buf[data_len] = '\0';
+
+    /* ===== 打印函数名和长度 ===== */
+    printk(KERN_INFO "========================================");
+    printk(KERN_INFO "[%s] len=%zu\n", func_name, data_len);
+
+    /* ===== 打印 ASCII（可读字符） ===== */
+    {
+        char ascii_buf[256];
+        int j, k = 0;
+        for (j = 0; j < data_len && j < 200 && k < sizeof(ascii_buf) - 1; j++) {
+            if (buf[j] >= 32 && buf[j] < 127) {
+                ascii_buf[k++] = buf[j];
+            } else if (buf[j] == '\n') {
+                ascii_buf[k++] = '\\';
+                ascii_buf[k++] = 'n';
+            } else if (buf[j] == '\r') {
+                ascii_buf[k++] = '\\';
+                ascii_buf[k++] = 'r';
+            } else {
+                ascii_buf[k++] = '.';
+            }
+        }
+        ascii_buf[k] = '\0';
+        printk(KERN_INFO "[%s] ASCII: %s\n", func_name, ascii_buf);
+    }
+
+    /* ===== 打印十六进制（前128字节） ===== */
+    printk(KERN_INFO "[%s] HEX (first 128 bytes):", func_name);
+    print_hex_dump(KERN_INFO, "", DUMP_PREFIX_OFFSET, 16, 1,
+                   buf, data_len < 128 ? data_len : 128, 1);
+
+    /* ===== 如果有 NMEA 数据，额外打印 ===== */
+    if (buf[0] == '$') {
+        printk(KERN_INFO "[%s] NMEA: %s\n", func_name, buf);
+    } else {
+        int i;
+        for (i = 0; i < data_len && i < 1024; i++) {
+            if (buf[i] == '$') {
+                printk(KERN_INFO "[%s] NMEA(found at %d): %s\n", func_name, i, buf + i);
+                break;
+            }
+        }
+    }
+
+    printk(KERN_INFO "========================================\n");
+
+    kfree(buf);
+}
+
+/* ========== 所有探针处理函数 ========== */
+static int proc_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    dump_all_data(regs, "YDATA_PROC");
     return 0;
 }
 
-/* ========== submit_pre ========== */
+static int recv_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    dump_all_data(regs, "YDATA_RECV");
+    return 0;
+}
+
+static int parse_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    dump_all_data(regs, "DATA_PKT_PARSE");
+    return 0;
+}
+
 static int submit_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    char *data_ptr;
-    size_t data_len;
-    unsigned long arg0, arg1, arg2;
+    dump_all_data(regs, "DATA_PKT_SUBMIT");
+    return 0;
+}
 
-    arg0 = regs->regs[0];
-    arg1 = regs->regs[1];
-    arg2 = regs->regs[2];
+static int read_link_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    dump_all_data(regs, "EACH_LINK_READ");
+    return 0;
+}
 
-    data_ptr = (char *)arg0;
-    data_len = (size_t)arg1;
-
-    if (data_len > 4096 || data_len == 0) {
-        data_ptr = (char *)arg1;
-        data_len = (size_t)arg2;
-    }
-
-    if (data_ptr == NULL || data_len == 0 || data_len > 4096)
-        return 0;
-
-    process_nmea(data_ptr, data_len, "SUBMIT");
+static int send_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    dump_all_data(regs, "AP2MCU_XDATA_SEND");
     return 0;
 }
 
@@ -277,44 +131,80 @@ static int submit_pre(struct kprobe *p, struct pt_regs *regs)
 static int __init kprobe_init(void)
 {
     int ret = 0;
-    int success = 0;
+    int registered = 0;
 
     kp_recv.symbol_name = "gps_mcudl_mcu2ap_ydata_recv";
     kp_recv.pre_handler = recv_pre;
     ret = register_kprobe(&kp_recv);
     if (ret == 0) {
-        printk(KERN_INFO "[KPROBE] ✅ 已钩住: gps_mcudl_mcu2ap_ydata_recv\n");
-        success++;
+        printk(KERN_INFO "[KPROBE] ✅ registered: ydata_recv\n");
+        registered++;
     } else {
-        printk(KERN_ERR "[KPROBE] ❌ recv 注册失败: %d\n", ret);
+        printk(KERN_ERR "[KPROBE] ❌ ydata_recv: %d\n", ret);
+    }
+
+    kp_proc.symbol_name = "gps_mcudl_mcu2ap_ydata_proc";
+    kp_proc.pre_handler = proc_pre;
+    ret = register_kprobe(&kp_proc);
+    if (ret == 0) {
+        printk(KERN_INFO "[KPROBE] ✅ registered: ydata_proc\n");
+        registered++;
+    } else {
+        printk(KERN_ERR "[KPROBE] ❌ ydata_proc: %d\n", ret);
+    }
+
+    kp_parse.symbol_name = "gps_mcudl_data_pkt_parse";
+    kp_parse.pre_handler = parse_pre;
+    ret = register_kprobe(&kp_parse);
+    if (ret == 0) {
+        printk(KERN_INFO "[KPROBE] ✅ registered: data_pkt_parse\n");
+        registered++;
+    } else {
+        printk(KERN_ERR "[KPROBE] ❌ data_pkt_parse: %d\n", ret);
     }
 
     kp_submit.symbol_name = "gps_mcudl_data_pkt_submit";
     kp_submit.pre_handler = submit_pre;
     ret = register_kprobe(&kp_submit);
     if (ret == 0) {
-        printk(KERN_INFO "[KPROBE] ✅ 已钩住: gps_mcudl_data_pkt_submit\n");
-        success++;
+        printk(KERN_INFO "[KPROBE] ✅ registered: data_pkt_submit\n");
+        registered++;
     } else {
-        printk(KERN_ERR "[KPROBE] ❌ submit 注册失败: %d\n", ret);
+        printk(KERN_ERR "[KPROBE] ❌ data_pkt_submit: %d\n", ret);
     }
 
-    if (success == 0) {
-        printk(KERN_ERR "[KPROBE] ❌ 所有钩子注册失败！\n");
-        return -1;
+    kp_read_link.symbol_name = "gps_mcudl_each_link_read";
+    kp_read_link.pre_handler = read_link_pre;
+    ret = register_kprobe(&kp_read_link);
+    if (ret == 0) {
+        printk(KERN_INFO "[KPROBE] ✅ registered: each_link_read\n");
+        registered++;
+    } else {
+        printk(KERN_ERR "[KPROBE] ❌ each_link_read: %d\n", ret);
     }
 
-    printk(KERN_INFO "[KPROBE] 🚀 GPS 数据篡改已启动 (成功 %d/2)\n", success);
-    printk(KERN_INFO "[KPROBE] 🎯 目标: %s,N  %s,E  海拔: %sm\n", FAKE_LAT, FAKE_LON, FAKE_ALT);
-    printk(KERN_INFO "[KPROBE] 🔄 修改: GGA + RMC 语句\n");
+    kp_send.symbol_name = "gps_mcudl_ap2mcu_xdata_send";
+    kp_send.pre_handler = send_pre;
+    ret = register_kprobe(&kp_send);
+    if (ret == 0) {
+        printk(KERN_INFO "[KPROBE] ✅ registered: ap2mcu_xdata_send\n");
+        registered++;
+    } else {
+        printk(KERN_ERR "[KPROBE] ❌ ap2mcu_xdata_send: %d\n", ret);
+    }
 
+    printk(KERN_INFO "[KPROBE] 🚀 已启动（成功 %d/6），输出所有符号数据\n", registered);
     return 0;
 }
 
 static void __exit kprobe_exit(void)
 {
+    unregister_kprobe(&kp_proc);
     unregister_kprobe(&kp_recv);
+    unregister_kprobe(&kp_parse);
     unregister_kprobe(&kp_submit);
+    unregister_kprobe(&kp_read_link);
+    unregister_kprobe(&kp_send);
     printk(KERN_INFO "[KPROBE] 已卸载\n");
 }
 
@@ -322,4 +212,4 @@ module_init(kprobe_init);
 module_exit(kprobe_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("GPS data modifier with GGA + RMC");
+MODULE_DESCRIPTION("GPS driver full data dump (ASCII + HEX)");
