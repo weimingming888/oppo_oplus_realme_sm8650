@@ -8,8 +8,10 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/seq_file.h>
+#include <linux/proc_fs.h>
 
 static struct kprobe kp_show_map;
+static struct kprobe kp_show_map_vma;
 
 #define TARGET_COMM "com.eltavine.duckdetector"
 
@@ -32,15 +34,16 @@ static pid_t find_pid_by_comm(const char *comm)
 }
 
 /* ========== 打印进程内存映射 ========== */
-static void print_maps(pid_t pid)
+static void print_maps_direct(pid_t pid)
 {
     struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     struct file *file;
-    char *path_buf;
-    char *path;
+    char *path_buf = NULL;
+    char *path = NULL;
     char flags[5];
+    int vma_count = 0;
 
     rcu_read_lock();
     task = find_task_by_vpid(pid);
@@ -65,7 +68,8 @@ static void print_maps(pid_t pid)
 
     mmap_read_lock(mm);
 
-    for (vma = mm->mmap; vma != NULL; vma = vma->vm_next) {
+    vma = mm->mmap;
+    while (vma != NULL) {
         flags[0] = (vma->vm_flags & VM_READ) ? 'r' : '-';
         flags[1] = (vma->vm_flags & VM_WRITE) ? 'w' : '-';
         flags[2] = (vma->vm_flags & VM_EXEC) ? 'x' : '-';
@@ -95,16 +99,35 @@ static void print_maps(pid_t pid)
         if (file != NULL && path != NULL && !IS_ERR(path)) {
             kfree(path);
         }
+
+        vma = vma->vm_next;
+        vma_count++;
     }
 
     mmap_read_unlock(mm);
-    printk(KERN_INFO "[MAPS] ========================================");
-    printk(KERN_INFO "[MAPS] VMA 数量: %d", mm->map_count);
 
+    printk(KERN_INFO "[MAPS] ========================================");
+    printk(KERN_INFO "[MAPS] VMA 数量: %d", vma_count);
     put_task_struct(task);
 }
 
-/* ========== kprobe 触发函数 ========== */
+/* ========== kprobe 触发函数 (show_map_vma) ========== */
+static int show_map_vma_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    pid_t pid;
+
+    printk(KERN_INFO "[KPROBE] show_map_vma 被调用");
+
+    pid = find_pid_by_comm(TARGET_COMM);
+    if (pid > 0) {
+        printk(KERN_INFO "[KPROBE] 找到目标进程: %s (PID=%d)", TARGET_COMM, pid);
+        print_maps_direct(pid);
+    }
+
+    return 0;
+}
+
+/* ========== kprobe 触发函数 (show_map) ========== */
 static int show_map_pre(struct kprobe *p, struct pt_regs *regs)
 {
     pid_t pid;
@@ -114,9 +137,7 @@ static int show_map_pre(struct kprobe *p, struct pt_regs *regs)
     pid = find_pid_by_comm(TARGET_COMM);
     if (pid > 0) {
         printk(KERN_INFO "[KPROBE] 找到目标进程: %s (PID=%d)", TARGET_COMM, pid);
-        print_maps(pid);
-    } else {
-        printk(KERN_INFO "[KPROBE] 未找到进程: %s", TARGET_COMM);
+        print_maps_direct(pid);
     }
 
     return 0;
@@ -125,41 +146,43 @@ static int show_map_pre(struct kprobe *p, struct pt_regs *regs)
 /* ==================================================== */
 static int __init kprobe_init(void)
 {
-    int ret;
+    int ret = 0;
     pid_t pid;
 
     printk(KERN_INFO "[KPROBE] 🔍 模块加载开始");
 
-    /* 尝试钩住 show_map_vma */
-    kp_show_map.symbol_name = "show_map_vma";
+    /* ===== 尝试钩住 show_map_vma ===== */
+    kp_show_map_vma.symbol_name = "show_map_vma";
+    kp_show_map_vma.pre_handler = show_map_vma_pre;
+
+    ret = register_kprobe(&kp_show_map_vma);
+    if (ret == 0) {
+        printk(KERN_INFO "[KPROBE] ✅ 已钩住 show_map_vma");
+        printk(KERN_INFO "[KPROBE] ⚡ 当 show_map_vma 被调用时将打印目标进程内存映射");
+        goto done;
+    }
+    printk(KERN_WARNING "[KPROBE] ⚠️ show_map_vma 注册失败: %d", ret);
+
+    /* ===== 如果失败，尝试钩住 show_map ===== */
+    kp_show_map.symbol_name = "show_map";
     kp_show_map.pre_handler = show_map_pre;
 
     ret = register_kprobe(&kp_show_map);
     if (ret == 0) {
-        printk(KERN_INFO "[KPROBE] ✅ 已钩住 show_map_vma");
-        printk(KERN_INFO "[KPROBE] ⚡ 当 show_map_vma 被调用时将触发");
-        goto done;
-    }
-
-    /* 如果 show_map_vma 失败，尝试 show_map */
-    printk(KERN_WARNING "[KPROBE] ⚠️ show_map_vma 注册失败: %d, 尝试 show_map", ret);
-    kp_show_map.symbol_name = "show_map";
-    ret = register_kprobe(&kp_show_map);
-    if (ret == 0) {
         printk(KERN_INFO "[KPROBE] ✅ 已钩住 show_map");
-        printk(KERN_INFO "[KPROBE] ⚡ 当 show_map 被调用时将触发");
+        printk(KERN_INFO "[KPROBE] ⚡ 当 show_map 被调用时将打印目标进程内存映射");
         goto done;
     }
-
     printk(KERN_WARNING "[KPROBE] ⚠️ show_map 注册失败: %d", ret);
-    printk(KERN_INFO "[KPROBE] 💡 将继续直接打印目标进程的内存映射");
+
+    printk(KERN_INFO "[KPROBE] 💡 没有可用的符号，将直接打印目标进程的内存映射");
 
 done:
-    /* 查找目标进程并打印内存映射 */
+    /* ===== 打印目标进程内存映射 ===== */
     pid = find_pid_by_comm(TARGET_COMM);
     if (pid > 0) {
         printk(KERN_INFO "[KPROBE] ✅ 找到目标进程: %s (PID=%d)", TARGET_COMM, pid);
-        print_maps(pid);
+        print_maps_direct(pid);
     } else {
         printk(KERN_WARNING "[KPROBE] ⚠️ 进程 %s 未找到", TARGET_COMM);
         printk(KERN_INFO "[KPROBE] 💡 启动目标 App 后重新加载本模块");
@@ -171,6 +194,7 @@ done:
 
 static void __exit kprobe_exit(void)
 {
+    unregister_kprobe(&kp_show_map_vma);
     unregister_kprobe(&kp_show_map);
     printk(KERN_INFO "[KPROBE] 已卸载");
 }
