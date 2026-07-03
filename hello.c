@@ -25,11 +25,10 @@ static void dump_data(struct pt_regs *regs, const char *func_name)
     arg1 = regs->regs[1];
     arg2 = regs->regs[2];
 
-    /* 尝试不同的参数组合（根据函数原型调整） */
+    /* 尝试不同的参数组合 */
     data_ptr = (char *)arg0;
     data_len = (size_t)arg1;
 
-    /* 如果第一个参数看起来不像指针（太小），尝试其他参数 */
     if (data_len > 4096 || data_len == 0) {
         data_ptr = (char *)arg1;
         data_len = (size_t)arg2;
@@ -42,27 +41,46 @@ static void dump_data(struct pt_regs *regs, const char *func_name)
     if (buf == NULL)
         return;
 
-    /* 直接读取内核内存（data_ptr 是内核地址） */
     memcpy(buf, data_ptr, data_len);
     buf[data_len] = '\0';
 
     /* 检查是否是 NMEA 数据（以 $ 开头） */
     if (buf[0] == '$') {
+        /* 直接打印 NMEA 句子 */
         printk(KERN_INFO "📡 [%s] NMEA: %s\n", func_name, buf);
     } else {
-        /* 打印十六进制（前64字节） */
-        printk(KERN_INFO "📦 [%s] DATA(len=%zu): ", func_name, data_len);
-        print_hex_dump(KERN_INFO, "", DUMP_PREFIX_NONE, 16, 1, buf, data_len < 64 ? data_len : 64, 1);
+        /* 尝试查找 $ 字符（可能数据在中间） */
+        int i;
+        int found = 0;
+        for (i = 0; i < data_len && i < 1024; i++) {
+            if (buf[i] == '$') {
+                printk(KERN_INFO "📡 [%s] NMEA(found): %s\n", func_name, buf + i);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            /* 打印 ASCII 可读字符 */
+            char ascii_buf[128];
+            int j, k = 0;
+            for (j = 0; j < data_len && j < 64 && k < sizeof(ascii_buf) - 1; j++) {
+                if (buf[j] >= 32 && buf[j] < 127) {
+                    ascii_buf[k++] = buf[j];
+                } else {
+                    ascii_buf[k++] = '.';
+                }
+            }
+            ascii_buf[k] = '\0';
+            printk(KERN_INFO "📦 [%s] ASCII(len=%zu): %s\n", func_name, data_len, ascii_buf);
+        }
     }
 
     kfree(buf);
 }
 
 /* ========== gps_mcudl_data_pkt_submit ========== */
-/* 这个函数最关键，它提交解析后的数据包给上层 */
 static int submit_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    printk(KERN_INFO "🟠 [DATA_PKT_SUBMIT] called");
     dump_data(regs, "SUBMIT");
     return 0;
 }
@@ -70,7 +88,6 @@ static int submit_pre(struct kprobe *p, struct pt_regs *regs)
 /* ========== gps_mcudl_mcu2ap_ydata_recv ========== */
 static int recv_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    printk(KERN_INFO "🟢 [YDATA_RECV] called");
     dump_data(regs, "RECV");
     return 0;
 }
@@ -78,30 +95,24 @@ static int recv_pre(struct kprobe *p, struct pt_regs *regs)
 /* ========== gps_mcudl_mcu2ap_ydata_proc ========== */
 static int proc_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    /* 减少打印频率，只打印调用，不打印数据 */
-    /* printk(KERN_INFO "🔵 [YDATA_PROC] called\n"); */
     return 0;
 }
 
 /* ========== gps_mcudl_data_pkt_parse ========== */
 static int parse_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    /* 减少打印频率 */
-    /* printk(KERN_INFO "🟡 [DATA_PKT_PARSE] called\n"); */
     return 0;
 }
 
 /* ========== gps_mcudl_each_link_read ========== */
 static int read_link_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    printk(KERN_INFO "🔴 [EACH_LINK_READ] called");
     return 0;
 }
 
 /* ========== gps_mcudl_ap2mcu_xdata_send ========== */
 static int send_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    printk(KERN_INFO "🟣 [AP2MCU_XDATA_SEND] called");
     return 0;
 }
 
@@ -178,4 +189,4 @@ module_init(kprobe_init);
 module_exit(kprobe_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("GPS driver function monitor with data dump");
+MODULE_DESCRIPTION("GPS driver function monitor with ASCII dump");
